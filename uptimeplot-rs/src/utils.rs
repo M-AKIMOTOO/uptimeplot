@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc, Datelike, Timelike};
 use astro::coords;
 use astro::time;
 use blh::{ellipsoid, GeocentricCoord, GeodeticCoord};
-
+use std::process::Command;
+use std::path::Path;
 
 pub fn radec2azalt(ant_position: [f64; 3], time: DateTime<Utc>, obs_ra: f64, obs_dec: f64) -> (f64, f64, f64) {
     let obs_year = time.year() as i16;
@@ -32,8 +33,45 @@ pub fn radec2azalt(ant_position: [f64; 3], time: DateTime<Utc>, obs_ra: f64, obs
     let mean_sidereal = time::mn_sidr(julian_day);
     let hour_angle = coords::hr_angl_frm_observer_long(mean_sidereal, -longitude_radian, obs_ra as f64);
 
-    let source_az = coords::az_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f64 +180.0; 
-    let source_el = coords::alt_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f64;
+    (coords::az_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f64 +180.0, 
+     coords::alt_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f64, 
+     height_meter as f64)
+}
 
-    (source_az, source_el, height_meter as f64)
+pub fn open_file_in_external_editor(file_path: &str) -> Result<(), String> {
+    let path = Path::new(file_path);
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(&["/C", "start", "", file_path])
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(file_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(file_path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file: {}", e))?;
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        return Err("Unsupported operating system for opening files.".to_string());
+    }
+
+    Ok(())
 }

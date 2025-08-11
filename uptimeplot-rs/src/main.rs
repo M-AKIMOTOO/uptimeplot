@@ -425,6 +425,12 @@ impl UptimePlotApp {
                     Err(e) => self.error_msg = Some(e),
                 }
             }
+            if ui.button("Open Stations").clicked() {
+                match utils::open_file_in_external_editor(&self.station_file_path) {
+                    Ok(_) => self.error_msg = None,
+                    Err(e) => self.error_msg = Some(e),
+                }
+            }
         });
         ui.add_space(10.0);
 
@@ -445,12 +451,18 @@ impl UptimePlotApp {
                     Err(e) => self.error_msg = Some(e),
                 }
             }
+            if ui.button("Open Sources").clicked() {
+                match utils::open_file_in_external_editor(&self.source_file_path) {
+                    Ok(_) => self.error_msg = None,
+                    Err(e) => self.error_msg = Some(e),
+                }
+            }
         });
         ui.add_space(10.0);
 
         ui.horizontal(|ui| {
             ui.label("Search Filter:");
-            ui.text_edit_singleline(&mut self.search_query);
+            ui.add(egui::TextEdit::singleline(&mut self.search_query).frame(true));
         });
 
         ui.separator();
