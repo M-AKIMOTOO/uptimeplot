@@ -372,10 +372,11 @@ impl UptimePlotApp {
             .legend(Legend::default());
 
         let plot_el = Plot::new("el_plot").width(ui.available_width()).height(ui.available_height() / 2.0)
+            .x_axis_label("Time (UT)")
             .y_axis_label("Elevation (deg)")
             .y_axis_width(4)
             .include_x(0.0).include_x(24.0)
-            .include_y(-90.0).include_y(90.0)
+            .include_y(0.0).include_y(90.0)
             .allow_drag(false).allow_zoom(false).allow_scroll(false)
             .x_grid_spacer(|_input| {[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0].into_iter().map(|v| GridMark { value: v, step_size: 3.0 }).collect::<Vec<_>>()})
             .x_axis_formatter(|m, _, _| format!( "{:.0}", m.value as u32)).show_x(true)
@@ -504,7 +505,7 @@ impl UptimePlotApp {
     }
 
     fn ui_polar_plot_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Polar Plot");
+        //ui.heading("Polar Plot");
 
         let plot = Plot::new("polar_plot")
             .width(ui.available_width()) // Added
@@ -525,7 +526,7 @@ impl UptimePlotApp {
             // Draw circles for elevation levels (e.g., 0, 30, 60, 90)
             // 90 deg el is center (radius 0), 0 deg el is outer edge (radius 1)
             // So, radius = (90 - el) / 90
-            for el_level in [0.0, 30.0, 60.0, 90.0] {
+            for el_level in [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0] {
                 let radius = (90.0 - el_level) / 90.0;
                 if radius >= 0.0 { // Ensure radius is non-negative
                     let num_segments = 100;
@@ -536,29 +537,29 @@ impl UptimePlotApp {
                         let y = radius * angle.sin();
                         circle_points.push([x, y]);
                     }
-                    plot_ui.line(Line::new(PlotPoints::from(circle_points)).stroke(egui::Stroke::new(2.0, egui::Color32::WHITE)));
+                    plot_ui.line(Line::new(PlotPoints::from(circle_points)).stroke(egui::Stroke::new(2.0, egui::Color32::DARK_GRAY)));
 
                     // Add elevation labels
                     if el_level != 90.0 { // Don't label the center point
                         let label_text = format!("{:.0}°", el_level);
                         // Position the label slightly inside the circle, at 0 azimuth (North)
-                        let label_x = radius * 0.9 * (90.0f64).to_radians().cos();
-                        let label_y = radius * 0.9 * (90.0f64).to_radians().sin();
-                        plot_ui.text(egui_plot::Text::new(egui_plot::PlotPoint::new(label_x, label_y), label_text).color(egui::Color32::WHITE));
+                        let label_x = radius * 0.96 * (75.0f64).to_radians().cos();
+                        let label_y = radius * 0.96 * (75.0f64).to_radians().sin();
+                        plot_ui.text(egui_plot::Text::new(egui_plot::PlotPoint::new(label_x, label_y), label_text).color(egui::Color32::DARK_GRAY));
                     }
                 }
             }
 
             // Draw radial lines for azimuth (e.g., 0, 90, 180, 270)
-            for az_level in [0.0, 90.0, 180.0, 270.0] {
+            for az_level in [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
                 let angle_rad = (90.0f64 - az_level).to_radians(); // Adjust for egui_plot's 0 deg at positive x-axis, clockwise
                 let x = 1.0 * angle_rad.cos();
                 let y = 1.0 * angle_rad.sin();
-                plot_ui.line(Line::new(PlotPoints::from(vec![[0.0, 0.0], [x, y]])).stroke(egui::Stroke::new(2.0, egui::Color32::WHITE)));
+                plot_ui.line(Line::new(PlotPoints::from(vec![[0.0, 0.0], [x, y]])).stroke(egui::Stroke::new(2.0, egui::Color32::DARK_GRAY)));
 
                 // Add azimuth labels
                 let label_text = format!("{:.0}°", az_level);
-                plot_ui.text(egui_plot::Text::new(egui_plot::PlotPoint::new(x * 1.1, y * 1.1), label_text).color(egui::Color32::WHITE));
+                plot_ui.text(egui_plot::Text::new(egui_plot::PlotPoint::new(x * 1.1, y * 1.1), label_text).color(egui::Color32::DARK_GRAY));
             }
 
             for (name, az_points, el_points) in &self.plot_data {
