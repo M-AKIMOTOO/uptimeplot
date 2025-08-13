@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::io::{BufReader, BufRead};
 use image;
 use bytemuck;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 mod utils;
 
@@ -262,7 +262,7 @@ impl UptimePlotApp {
             if !*selected { continue; }
 
             let mut full_day_points = Vec::new();
-            for i in 0..=(24 * 60) { // 1 minute intervals
+            for i in (0..=(24 * 60)).step_by(3) { // 3 minute intervals
                 let hour_float = (i as f64) / 60.0;
                 let h = (i / 60) as u32;
                 let m = (i % 60) as u32;
@@ -364,9 +364,10 @@ impl UptimePlotApp {
             .include_x(0.0).include_x(24.0)
             .include_y(0.0).include_y(360.0)
             .allow_drag(false).allow_zoom(false).allow_scroll(false)
+            .x_axis_label("") // Re-added
+            .x_axis_formatter(|_,_,_| "".to_string()) // Re-added
             .x_grid_spacer(|_input| {[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0].into_iter().map(|v| GridMark { value: v, step_size: 3.0 }).collect::<Vec<_>>()})
             .y_grid_spacer(|_input| {[0.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0, 210.0, 240.0, 270.0, 300.0, 330.0, 360.0].into_iter().map(|v| GridMark { value: v, step_size: 30.0 }).collect::<Vec<_>>()})
-            .x_axis_formatter(|m, _, _| format!( "{:.0}", m.value as i32)).show_y(false)
             .y_axis_formatter(|m, _, _| format!( "{:.0}", m.value as i32)).show_y(true)
             .coordinates_formatter(Corner::LeftTop, egui_plot::CoordinatesFormatter::new(move |plot_point, _plot_bounds| az_pointer_formatter(plot_point.x, plot_point.y)))
             .legend(Legend::default());
@@ -404,104 +405,164 @@ impl UptimePlotApp {
         ui.heading("Parameters");
         ui.add_space(10.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Station:");
-            egui::ComboBox::new("station_combo", "")
-                .selected_text(if self.stations.is_empty() { "No stations loaded" } else { &self.stations[self.selected_station].name })
-                .show_ui(ui, |ui| {
-                    if self.stations.is_empty() {
-                        ui.label("Load stations from station.txt");
-                    } else {
-                        for (i, station) in self.stations.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_station, i, &station.name);
-                        }
-                    }
+        ui.columns(2, |columns| {
+            // --- Left Column: Settings and File Formats ---
+            egui::ScrollArea::vertical().show(&mut columns[0], |ui| {
+                // --- Station Settings ---
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("📡 Station Settings");
+                    ui.add_space(5.0);
+                    egui::Grid::new("station_grid").num_columns(2).spacing([40.0, 4.0]).striped(true).show(ui, |ui| {
+                        ui.label("Station:");
+                        egui::ComboBox::new("station_combo", "")
+                            .selected_text(if self.stations.is_empty() { "No stations loaded" } else { &self.stations[self.selected_station].name })
+                            .show_ui(ui, |ui| {
+                                if self.stations.is_empty() {
+                                    ui.label("Load stations from station.txt");
+                                } else {
+                                    for (i, station) in self.stations.iter().enumerate() {
+                                        ui.selectable_value(&mut self.selected_station, i, &station.name);
+                                    }
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Station File:");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.station_file_path);
+                            if ui.button("Load").clicked() {
+                                match self.load_stations() {
+                                    Ok(_) => self.error_msg = None,
+                                    Err(e) => self.error_msg = Some(e),
+                                }
+                            }
+                            if ui.button("Open").clicked() {
+                                match utils::open_file_in_external_editor(&self.station_file_path) {
+                                    Ok(_) => self.error_msg = None,
+                                    Err(e) => self.error_msg = Some(e),
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
                 });
-            ui.add_space(10.0); // Add space between combo box and text edit
-            ui.label("Station File:");
-            ui.text_edit_singleline(&mut self.station_file_path);
-            if ui.button("Load Stations").clicked() {
-                match self.load_stations() {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if ui.button("Open Stations").clicked() {
-                match utils::open_file_in_external_editor(&self.station_file_path) {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-        });
-        ui.add_space(10.0);
+                ui.add_space(10.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Observation Date:");
-            if ui.button(self.selected_date.format("%Y-%m-%d").to_string()).clicked() {
-                self.show_calendar = !self.show_calendar;
-            }
-        });
-        ui.add_space(10.0);
+                // --- Observation Settings ---
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Observation Settings");
+                    ui.add_space(5.0);
+                    egui::Grid::new("obs_grid").num_columns(2).spacing([40.0, 4.0]).striped(true).show(ui, |ui| {
+                        ui.label("Observation Date:");
+                        if ui.button(self.selected_date.format("%Y-%m-%d").to_string()).clicked() {
+                            self.show_calendar = !self.show_calendar;
+                        }
+                        ui.end_row();
+                    });
+                });
+                ui.add_space(10.0);
 
-        ui.label("Source List File:");
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.source_file_path);
-            if ui.button("Load Sources").clicked() {
-                match self.load_sources() {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if ui.button("Open Sources").clicked() {
-                match utils::open_file_in_external_editor(&self.source_file_path) {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-        });
-        ui.add_space(10.0);
+                // --- Source Settings ---
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("🔭 Source Settings");
+                    ui.add_space(5.0);
+                    egui::Grid::new("source_settings_grid").num_columns(2).spacing([40.0, 4.0]).striped(true).show(ui, |ui| {
+                        ui.label("Source List File:");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut self.source_file_path);
+                            if ui.button("Load").clicked() {
+                                match self.load_sources() {
+                                    Ok(_) => self.error_msg = None,
+                                    Err(e) => self.error_msg = Some(e),
+                                }
+                            }
+                            if ui.button("Open").clicked() {
+                                match utils::open_file_in_external_editor(&self.source_file_path) {
+                                    Ok(_) => self.error_msg = None,
+                                    Err(e) => self.error_msg = Some(e),
+                                }
+                            }
+                        });
+                        ui.end_row();
 
-        ui.horizontal(|ui| {
-            ui.label("Search Filter:");
-            ui.add(egui::TextEdit::singleline(&mut self.search_query).frame(true));
-        });
+                        ui.label("Search Filter:");
+                        ui.add(egui::TextEdit::singleline(&mut self.search_query).frame(true));
+                        ui.end_row();
+                    });
 
-        ui.separator();
-
-        ui.label("Select Sources to Plot:");
-        egui::ScrollArea::vertical().max_height(ui.available_height() - 80.0).show(ui, |ui| {
-            if self.sources.is_empty() {
-                ui.label("(No sources loaded)");
-            } else {
-                egui::Grid::new("source_grid").show(ui, |ui| {
-                    let mut displayed_count = 0;
-                    for (_i, (source, selected)) in self.sources.iter_mut().enumerate() {
-                        if self.search_query.is_empty() || source.name.to_lowercase().contains(&self.search_query.to_lowercase()) {
-                            ui.checkbox(selected, &source.name);
-                            displayed_count += 1;
-                            if displayed_count % 10 == 0 {
-                                ui.end_row();
+                    ui.separator();
+                    ui.label("Select Sources to Plot:");
+                    ui.horizontal(|ui|{
+                        if ui.button("Plot Selected").clicked() {
+                            self.calculate_plots();
+                        }
+                        if ui.button("Reset Source Selection").clicked() {
+                            for (_, selected) in &mut self.sources {
+                                *selected = false;
                             }
                         }
-                    }
+                    });
+
+                    egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                        if self.sources.is_empty() {
+                            ui.label("(No sources loaded)");
+                        } else {
+                            egui::Grid::new("source_grid").show(ui, |ui| {
+                                let mut displayed_count = 0;
+                                for (_i, (source, selected)) in self.sources.iter_mut().enumerate() {
+                                    if self.search_query.is_empty() || source.name.to_lowercase().contains(&self.search_query.to_lowercase()) {
+                                        ui.checkbox(selected, &source.name);
+                                        displayed_count += 1;
+                                        if displayed_count % 8 == 0 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
                 });
-            }
+                ui.add_space(10.0);
+
+                // --- File Formats (Moved here) ---
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("📄 File Format Information");
+                    ui.add_space(5.0);
+                    ui.label("station.txt format (ECEF): NAME X_POS Y_POS Z_POS");
+                    ui.label("e.g. YAMAGU32 -3502544.587 3950966.235 3566381.192");
+                    ui.separator();
+                    ui.label("source.txt format: NAME  RA_H  RA_M  RA_S  DEC_D  DEC_M  DEC_S");
+                    ui.label("e.g. 3C273  12 29 06.7 +02 03 08.6");
+                });
+
+                if let Some(err) = &self.error_msg {
+                    ui.add_space(10.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+            });
+
+            // --- Right Column: Usage Only ---
+            egui::ScrollArea::vertical().show(&mut columns[1], |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("ℹProgram Usage");
+                    ui.add_space(5.0);
+                    let mut help_text = CliArgs::command().render_help().to_string();
+                    // Revert to ui.code() for now
+                    ui.add(egui::TextEdit::multiline(&mut help_text)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false)
+                        .font(egui::TextStyle::Monospace));
+                    ui.label("1. Push the Load button in Source settings.");
+                    ui.label("2. Select some targets for drawing an uptime plot.");
+                    ui.label("3. Push the Plot Selected button in Source settings.");
+                    ui.label("4. Push the Uptime Plotters button in the upper left corner in this tab.");
+                    ui.label("");
+                    ui.label("To create a new uptime plot graph, first, push the \"Reset Source Selection\" button in Source Settings to clear previous selections. Then, you can repeat steps 1 to 4 to generate a new plot.");
+                    ui.label("");
+                    ui.label("If you want to edit the data files for sources or stations, please push the \"Open\" buttons in Station Settings and Source Settings.");
+                });
+            });
         });
-
-        ui.separator();
-        if ui.button("Plot Selected").clicked() {
-            self.calculate_plots();
-        }
-        if ui.button("Reset Source Selection").clicked() {
-            for (_, selected) in &mut self.sources {
-                *selected = false;
-            }
-        }
-
-        if let Some(err) = &self.error_msg {
-            ui.add_space(10.0);
-            ui.colored_label(egui::Color32::RED, err);
-        }
     }
 
     fn ui_polar_plot_tab(&mut self, ui: &mut egui::Ui) {
@@ -543,8 +604,8 @@ impl UptimePlotApp {
                     if el_level != 90.0 { // Don't label the center point
                         let label_text = format!("{:.0}°", el_level);
                         // Position the label slightly inside the circle, at 0 azimuth (North)
-                        let label_x = radius * 0.96 * (75.0f64).to_radians().cos();
-                        let label_y = radius * 0.96 * (75.0f64).to_radians().sin();
+                        let label_x = radius * (72.0f64).to_radians().cos();
+                        let label_y = radius * (72.0f64).to_radians().sin();
                         plot_ui.text(egui_plot::Text::new(egui_plot::PlotPoint::new(label_x, label_y), label_text).color(egui::Color32::DARK_GRAY));
                     }
                 }
