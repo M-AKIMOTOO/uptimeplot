@@ -1,0 +1,30 @@
+[package]
+name = "uptimeplot"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "uptimeplot"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = "1.15"
+image = { version = "0.24", default-features = false, features = ["png"] }
+eframe = "0.26.0"
+egui = "0.26.0"
+egui_plot = "0.26.0"
+chrono = "0.4"
+astro = "2.0.0"
+nav-types = "0.5"
+clap = { version = "4", features = ["derive"] }
+# Pin to rustc-1.85-compatible release to avoid pulling home 0.5.12+
+home = "=0.5.5"
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
