@@ -9,16 +9,15 @@ path = "src/main.rs"
 
 [dependencies]
 bytemuck = "1.15"
-image = { version = "0.24", default-features = false, features = ["png"] }
-eframe = "0.26.0"
-egui = "0.26.0"
-egui_plot = "0.26.0"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+eframe = "0.34.3"
+egui = "0.34.3"
+egui_plot = "0.35.0"
 chrono = "0.4"
 astro = "2.0.0"
 nav-types = "0.5"
 clap = { version = "4", features = ["derive"] }
-# Pin to rustc-1.85-compatible release to avoid pulling home 0.5.12+
-home = "=0.5.5"
+home = "0.5.12"
 
 [profile.release]
 opt-level = 3

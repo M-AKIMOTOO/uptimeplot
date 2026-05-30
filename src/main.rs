@@ -12,6 +12,26 @@ use std::path::{Path, PathBuf};
 
 mod utils;
 
+const PLOT_Y_AXIS_MIN_WIDTH: f32 = 96.0;
+
+const SKD_COL_NUM: f32 = 24.0;
+const SKD_COL_SOURCE: f32 = 116.0;
+const SKD_COL_DATE: f32 = 90.0;
+const SKD_COL_TIME: f32 = 110.0;
+const SKD_COL_DURATION: f32 = 80.0;
+const SKD_COL_AZEL: f32 = 104.0;
+const SKD_COL_ANTENNA: f32 = 220.0;
+const SKD_COL_DELETE: f32 = 44.0;
+const SKD_TABLE_MIN_WIDTH: f32 = SKD_COL_NUM
+    + SKD_COL_SOURCE
+    + SKD_COL_DATE
+    + SKD_COL_TIME
+    + SKD_COL_DURATION
+    + SKD_COL_AZEL * 2.0
+    + SKD_COL_ANTENNA * 2.0
+    + SKD_COL_DELETE
+    + 80.0;
+
 #[derive(PartialEq, Clone, Copy)]
 enum AppTab {
     UptimePlotters,
@@ -62,14 +82,14 @@ fn main() -> Result<(), eframe::Error> {
             let app = Box::new(UptimePlotApp::new(cli_args)); // Call new constructor
 
             // Increase font size
-            let mut style = (*cc.egui_ctx.style()).clone();
+            let mut style = (*cc.egui_ctx.global_style()).clone();
             for (_text_style, font_id) in style.text_styles.iter_mut() {
                 font_id.size *= 1.5; // Increase by 1.5 times
             }
             style.visuals.panel_fill = egui::Color32::TRANSPARENT;
-            cc.egui_ctx.set_style(style);
+            cc.egui_ctx.set_global_style(style);
 
-            app
+            Ok(app)
         }),
     )
 }
@@ -117,12 +137,15 @@ struct SkdRow {
     el_offset_deg: f64,
     ra_offset_deg: f64,
     dec_offset_deg: f64,
+    include_station_offsets: bool,
 }
 
 #[derive(Clone)]
 struct SkdRowStatus {
-    geometry: String,
-    motion: String,
+    start_geometry: String,
+    end_geometry: String,
+    motion_1: String,
+    motion_2: String,
 }
 
 impl Antenna {
@@ -174,6 +197,99 @@ impl Antenna {
     }
 }
 
+type ScanEnd = (chrono::NaiveDateTime, f64, f64);
+
+fn antenna_motion_status(
+    row: &SkdRow,
+    source: &Source,
+    antenna: &Antenna,
+    prev_end: Option<ScanEnd>,
+) -> (String, Option<ScanEnd>) {
+    match (
+        scan_az_el_for(row, source, antenna.pos, false),
+        scan_az_el_for(row, source, antenna.pos, true),
+    ) {
+        (Some((start_dt, start_az, start_el)), Some((end_dt, end_az, end_el))) => {
+            let limit_text = if antenna.allows(start_az, start_el) && antenna.allows(end_az, end_el)
+            {
+                "OK"
+            } else {
+                "NO"
+            };
+
+            let motion = if let Some((prev_end_dt, prev_end_az, prev_end_el)) = prev_end {
+                let gap_sec = (start_dt - prev_end_dt).num_seconds();
+                if gap_sec < 0 {
+                    format!("{} NO", limit_text)
+                } else {
+                    match antenna.slew_seconds(prev_end_az, prev_end_el, start_az, start_el) {
+                        Some(need_sec) if (gap_sec as f64) + 1.0e-6 >= need_sec => {
+                            format!("{} OK {:.0}/{:.0}s", limit_text, need_sec.ceil(), gap_sec)
+                        }
+                        Some(need_sec) => {
+                            format!("{} NO {:.0}/{:.0}s", limit_text, need_sec.ceil(), gap_sec)
+                        }
+                        None => format!("{} NO", limit_text),
+                    }
+                }
+            } else {
+                limit_text.to_string()
+            };
+            (motion, Some((end_dt, end_az, end_el)))
+        }
+        _ => ("NO".to_string(), None),
+    }
+}
+
+fn source_table_text(name: &str) -> String {
+    let mut value: String = name.chars().take(8).collect();
+    while value.chars().count() < 8 {
+        value.push(' ');
+    }
+    value
+}
+
+fn show_table_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(text);
+        },
+    );
+}
+
+fn show_motion_status_cell(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.allocate_ui_with_layout(
+        egui::vec2(220.0, 20.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let mut tokens = text.split_whitespace();
+            let limit = tokens.next().unwrap_or("");
+            let slew = tokens.next().unwrap_or("");
+            let time = tokens.next().unwrap_or("");
+
+            show_status_token(ui, limit, 28.0);
+            show_status_token(ui, slew, 28.0);
+            ui.add_sized([84.0, 20.0], egui::Label::new(time));
+        },
+    )
+    .response
+}
+
+fn show_status_token(ui: &mut egui::Ui, token: &str, width: f32) {
+    let color = match token {
+        "OK" => egui::Color32::GREEN,
+        "NO" => egui::Color32::RED,
+        _ => ui.visuals().text_color(),
+    };
+    ui.add_sized(
+        [width, 20.0],
+        egui::Label::new(egui::RichText::new(token).color(color)),
+    );
+}
+
 struct UptimePlotApp {
     stations: Vec<Station>,
     selected_station: usize,
@@ -187,6 +303,7 @@ struct UptimePlotApp {
     sources: Vec<(Source, bool)>,
     antennas: Vec<Antenna>,
     selected_antenna: usize,
+    selected_antenna_2: usize,
     skd_rows: Vec<SkdRow>,
     skd_status_cache: Vec<SkdRowStatus>,
     skd_status_dirty: bool,
@@ -207,6 +324,7 @@ struct UptimePlotApp {
     five_point_obstime_sec: u32,
     five_point_slew_sec: u32,
     five_point_offset_deg: f64,
+    five_point_include_station_offsets: bool,
     five_point_clear_existing: bool,
     target_picker_open: bool,
     cal_picker_open: bool,
@@ -298,10 +416,11 @@ impl UptimePlotApp {
                 .to_string(),
             input_drg_file_path: String::new(),
             obs_code: String::new(),
-            pi_name: String::new(),
+            pi_name: "hogehoge".to_string(),
             sources: Vec::new(),
             antennas: Vec::new(),
             selected_antenna: 0,
+            selected_antenna_2: 0,
             skd_rows: Vec::new(),
             skd_status_cache: Vec::new(),
             skd_status_dirty: true,
@@ -322,6 +441,7 @@ impl UptimePlotApp {
             five_point_obstime_sec: 60,
             five_point_slew_sec: 30,
             five_point_offset_deg: 1.2,
+            five_point_include_station_offsets: false,
             five_point_clear_existing: false,
             target_picker_open: false,
             cal_picker_open: false,
@@ -348,8 +468,9 @@ impl UptimePlotApp {
 }
 
 impl eframe::App for UptimePlotApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.show_calendar_window(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.show_calendar_window(&ctx);
 
         if let Some(image) = ctx.input(|i| {
             i.events.iter().find_map(|e| {
@@ -363,7 +484,7 @@ impl eframe::App for UptimePlotApp {
             self.handle_output_screenshot(&image, ctx.pixels_per_point());
         }
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, AppTab::Parameters, "Parameters");
                 ui.selectable_value(
@@ -377,7 +498,7 @@ impl eframe::App for UptimePlotApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.selected_tab {
             AppTab::UptimePlotters => self.ui_uptime_plotters_tab(ui),
             AppTab::Parameters => self.ui_parameters_tab(ui),
             AppTab::PolarPlot => self.ui_polar_plot_tab(ui),
@@ -385,7 +506,7 @@ impl eframe::App for UptimePlotApp {
             AppTab::SkdTable => self.ui_skd_table_tab(ui),
         });
 
-        self.drive_output_capture(ctx);
+        self.drive_output_capture(&ctx);
     }
 }
 
@@ -474,6 +595,17 @@ impl UptimePlotApp {
             .iter()
             .position(|antenna| antenna.name == "YAMAGU32")
             .unwrap_or(0);
+        self.selected_antenna_2 = self
+            .antennas
+            .iter()
+            .position(|antenna| antenna.name == "YAMAGU34")
+            .unwrap_or_else(|| {
+                if self.antennas.len() > 1 {
+                    (self.selected_antenna + 1) % self.antennas.len()
+                } else {
+                    self.selected_antenna
+                }
+            });
         self.mark_skd_status_dirty();
         Ok(())
     }
@@ -753,7 +885,7 @@ impl UptimePlotApp {
             return;
         }
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         if let Some(state) = self.output_capture.as_mut() {
             state.screenshot_requested = true;
         }
@@ -894,6 +1026,9 @@ impl UptimePlotApp {
         if let Some(obs_code) = parse_exper_code(&content) {
             self.obs_code = obs_code;
         }
+        if let Some(pi_name) = parse_pi_name(&content) {
+            self.pi_name = pi_name;
+        }
 
         let mut sources = Vec::new();
         for line in section_lines(&content, "$SOURCES")? {
@@ -969,6 +1104,7 @@ impl UptimePlotApp {
                     el_offset_deg,
                     ra_offset_deg,
                     dec_offset_deg,
+                    include_station_offsets: false,
                 });
             }
         }
@@ -980,6 +1116,37 @@ impl UptimePlotApp {
         Ok(())
     }
 
+    fn output_directory_from_input_drg(&self) -> Option<PathBuf> {
+        let input_path = output_drg_path(&self.input_drg_file_path).ok()?;
+        input_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    }
+
+    fn path_in_output_directory(&self, path: PathBuf) -> PathBuf {
+        let Some(output_dir) = self.output_directory_from_input_drg() else {
+            return path;
+        };
+        let Some(file_name) = path.file_name() else {
+            return path;
+        };
+        output_dir.join(file_name)
+    }
+
+    fn obs_code_output_path(&self, obs_code: &str) -> Result<PathBuf, String> {
+        obs_code_output_path(obs_code).map(|path| self.path_in_output_directory(path))
+    }
+
+    fn obs_code_station_skd_output_path(
+        &self,
+        obs_code: &str,
+        station_suffix: &str,
+    ) -> Result<PathBuf, String> {
+        obs_code_station_skd_output_path(obs_code, station_suffix)
+            .map(|path| self.path_in_output_directory(path))
+    }
+
     fn write_skd_to_drg(&self) -> Result<Vec<PathBuf>, String> {
         if self.skd_rows.is_empty() {
             return Err("No SKED rows to write.".to_string());
@@ -988,9 +1155,9 @@ impl UptimePlotApp {
         if obs_code.is_empty() || obs_code.split_whitespace().count() != 1 {
             return Err("Obscode must be one non-empty word.".to_string());
         }
-        let drg_output_path = obs_code_output_path(obs_code)?;
-        let skd32_output_path = obs_code_station_skd_output_path(obs_code, "32")?;
-        let skd34_output_path = obs_code_station_skd_output_path(obs_code, "34")?;
+        let drg_output_path = self.obs_code_output_path(obs_code)?;
+        let skd32_output_path = self.obs_code_station_skd_output_path(obs_code, "32")?;
+        let skd34_output_path = self.obs_code_station_skd_output_path(obs_code, "34")?;
 
         let mut source_names: Vec<String> = Vec::new();
         for row in &self.skd_rows {
@@ -1067,6 +1234,7 @@ impl UptimePlotApp {
                 el_offset_deg,
                 ra_offset_deg: 0.0,
                 dec_offset_deg: 0.0,
+                include_station_offsets: self.five_point_include_station_offsets,
             });
             offset_sec += self.five_point_obstime_sec as i64 + self.five_point_slew_sec as i64;
         }
@@ -1111,6 +1279,7 @@ impl UptimePlotApp {
                 el_offset_deg: 0.0,
                 ra_offset_deg: 0.0,
                 dec_offset_deg: 0.0,
+                include_station_offsets: false,
             });
             offset_sec += self.interleave_cal_duration_sec as i64 + self.interleave_slew_sec as i64;
 
@@ -1125,6 +1294,7 @@ impl UptimePlotApp {
                 el_offset_deg: 0.0,
                 ra_offset_deg: 0.0,
                 dec_offset_deg: 0.0,
+                include_station_offsets: false,
             });
             offset_sec += self.interleave_target_duration_sec as i64;
             if cycle_idx + 1 < self.interleave_cycles {
@@ -1189,98 +1359,72 @@ impl UptimePlotApp {
             return;
         }
 
-        let ant_pos = self
-            .selected_antenna_ref()
+        let mut selected_antenna_indices = Vec::new();
+        for index in [self.selected_antenna, self.selected_antenna_2] {
+            if index < self.antennas.len() && !selected_antenna_indices.contains(&index) {
+                selected_antenna_indices.push(index);
+            }
+        }
+        let selected_antennas: Vec<Antenna> = selected_antenna_indices
+            .iter()
+            .filter_map(|&index| self.antennas.get(index).cloned())
+            .collect();
+        let ant_pos = selected_antennas
+            .first()
             .map(|antenna| antenna.pos)
             .or_else(|| self.station_position());
-        let antenna = self.selected_antenna_ref();
         let source_map: HashMap<&str, &Source> = self
             .sources
             .iter()
             .map(|(source, _)| (source.name.as_str(), source))
             .collect();
         let mut cache = Vec::with_capacity(self.skd_rows.len());
-        let mut prev_end: Option<(chrono::NaiveDateTime, f64, f64)> = None;
+        let mut prev_ends: Vec<Option<ScanEnd>> = vec![None; selected_antennas.len()];
 
         for row in &self.skd_rows {
             let Some(source) = source_map.get(row.source_name.as_str()).copied() else {
                 cache.push(SkdRowStatus {
-                    geometry: "Bad scan".to_string(),
-                    motion: "Bad scan".to_string(),
+                    start_geometry: "NO".to_string(),
+                    end_geometry: "NO".to_string(),
+                    motion_1: "NO".to_string(),
+                    motion_2: "NO".to_string(),
                 });
-                prev_end = None;
+                prev_ends.fill(None);
                 continue;
             };
 
-            let geometry = match ant_pos {
+            let (start_geometry, end_geometry) = match ant_pos {
                 Some(pos) => match (
                     scan_az_el_for(row, source, pos, false),
                     scan_az_el_for(row, source, pos, true),
                 ) {
-                    (Some((_, start_az, start_el)), Some((_, end_az, end_el))) => format!(
-                        "S {:5.1}/{:5.1}  E {:5.1}/{:5.1}",
-                        start_az, start_el, end_az, end_el
+                    (Some((_, start_az, start_el)), Some((_, end_az, end_el))) => (
+                        format!("{:5.1}/{:5.1}", start_az, start_el),
+                        format!("{:5.1}/{:5.1}", end_az, end_el),
                     ),
-                    _ => "Bad scan".to_string(),
+                    _ => ("NO".to_string(), "NO".to_string()),
                 },
-                None => "No antenna".to_string(),
+                None => ("No antenna".to_string(), "No antenna".to_string()),
             };
 
-            let (motion, current_end) = match antenna {
-                Some(antenna) => match (
-                    scan_az_el_for(row, source, antenna.pos, false),
-                    scan_az_el_for(row, source, antenna.pos, true),
-                ) {
-                    (Some((start_dt, start_az, start_el)), Some((end_dt, end_az, end_el))) => {
-                        let limit_text = if antenna.allows(start_az, start_el)
-                            && antenna.allows(end_az, end_el)
-                        {
-                            "LIM OK"
-                        } else {
-                            "LIM NG"
-                        };
+            let mut motion_values = vec![String::new(), String::new()];
+            if selected_antennas.is_empty() {
+                motion_values[0] = "Load ant".to_string();
+            } else {
+                for (ant_idx, antenna) in selected_antennas.iter().take(2).enumerate() {
+                    let (antenna_motion, current_end) =
+                        antenna_motion_status(row, source, antenna, prev_ends[ant_idx]);
+                    prev_ends[ant_idx] = current_end;
+                    motion_values[ant_idx] = antenna_motion;
+                }
+            }
 
-                        let motion = if let Some((prev_end_dt, prev_end_az, prev_end_el)) = prev_end
-                        {
-                            let gap_sec = (start_dt - prev_end_dt).num_seconds();
-                            if gap_sec < 0 {
-                                format!("{} OVERLAP", limit_text)
-                            } else {
-                                match antenna.slew_seconds(
-                                    prev_end_az,
-                                    prev_end_el,
-                                    start_az,
-                                    start_el,
-                                ) {
-                                    Some(need_sec) if (gap_sec as f64) + 1.0e-6 >= need_sec => {
-                                        format!(
-                                            "{} SLW OK {:.0}/{:.0}s",
-                                            limit_text,
-                                            need_sec.ceil(),
-                                            gap_sec
-                                        )
-                                    }
-                                    Some(need_sec) => format!(
-                                        "{} SLW NG {:.0}/{:.0}s",
-                                        limit_text,
-                                        need_sec.ceil(),
-                                        gap_sec
-                                    ),
-                                    None => format!("{} SLW NG", limit_text),
-                                }
-                            }
-                        } else {
-                            limit_text.to_string()
-                        };
-                        (motion, Some((end_dt, end_az, end_el)))
-                    }
-                    _ => ("Bad scan".to_string(), None),
-                },
-                None => ("Load ant".to_string(), None),
-            };
-
-            cache.push(SkdRowStatus { geometry, motion });
-            prev_end = current_end;
+            cache.push(SkdRowStatus {
+                start_geometry,
+                end_geometry,
+                motion_1: motion_values[0].clone(),
+                motion_2: motion_values[1].clone(),
+            });
         }
 
         self.skd_status_cache = cache;
@@ -1294,475 +1438,666 @@ impl UptimePlotApp {
             .find(|source| source.name == name)
     }
 
-    fn selected_antenna_ref(&self) -> Option<&Antenna> {
-        self.antennas.get(self.selected_antenna)
-    }
-
     fn ui_skd_table_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("SKD Table");
-        ui.add_space(8.0);
+        let available = ui.available_size();
+        let left_width = (available.x / 3.0).max(300.0);
+        let right_width = (available.x - left_width - 12.0).max(500.0);
+        let parameter_panel_width = (left_width - 28.0).max(280.0);
 
         ui.horizontal(|ui| {
-            ui.label("Input DRG:");
-            ui.text_edit_singleline(&mut self.input_drg_file_path);
-            if ui.button("Load DRG").clicked() {
-                match pick_file_dialog("Select DRG file") {
-                    Ok(Some(path)) => {
-                        self.input_drg_file_path = path.to_string_lossy().to_string();
-                        match self.load_drg_file() {
-                            Ok(_) => self.error_msg = Some("Loaded DRG.".to_string()),
-                            Err(e) => self.error_msg = Some(e),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if ui.button("Open Input").clicked() {
-                let input_path = output_drg_path(&self.input_drg_file_path)
-                    .map(|path| path.to_string_lossy().to_string());
-                match input_path.and_then(|path| utils::open_file_in_external_editor(&path)) {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Obscode:");
-            ui.text_edit_singleline(&mut self.obs_code);
-            ui.label("PI:");
-            ui.text_edit_singleline(&mut self.pi_name);
-            if ui.button("Create DRG").clicked() {
-                match self.write_skd_to_drg() {
-                    Ok(paths) => {
-                        self.error_msg = Some(format!(
-                            "Created {}",
-                            paths
-                                .iter()
-                                .map(|path| path.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
-                    }
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if ui.button("Open Output").clicked() {
-                let output_path = obs_code_output_path(self.obs_code.trim())
-                    .map(|path| path.to_string_lossy().to_string());
-                match output_path.and_then(|path| utils::open_file_in_external_editor(&path)) {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Output path:");
-            match (
-                obs_code_output_path(self.obs_code.trim()),
-                obs_code_station_skd_output_path(self.obs_code.trim(), "32"),
-                obs_code_station_skd_output_path(self.obs_code.trim(), "34"),
-            ) {
-                (Ok(drg_path), Ok(skd32_path), Ok(skd34_path)) => ui.monospace(format!(
-                    "{}, {}, {}",
-                    drg_path.display(),
-                    skd32_path.display(),
-                    skd34_path.display()
-                )),
-                _ => ui.monospace("<not set>"),
-            };
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Source List:");
-            ui.text_edit_singleline(&mut self.source_file_path);
-            if ui.button("Load Sources").clicked() {
-                match pick_file_dialog("Select source.txt") {
-                    Ok(Some(path)) => {
-                        self.source_file_path = path.to_string_lossy().to_string();
-                        match self.load_sources() {
-                            Ok(_) => self.error_msg = None,
-                            Err(e) => self.error_msg = Some(e),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if ui.button("Open Sources").clicked() {
-                match utils::open_file_in_external_editor(&self.source_file_path) {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            ui.label(format!("{} sources", self.sources.len()));
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Antenna SCH:");
-            ui.text_edit_singleline(&mut self.antenna_file_path);
-            if ui.button("Load Antennas").clicked() {
-                match pick_file_dialog("Select antenna.sch") {
-                    Ok(Some(path)) => {
-                        self.antenna_file_path = path.to_string_lossy().to_string();
-                        match self.load_antennas() {
-                            Ok(_) => self.error_msg = None,
-                            Err(e) => self.error_msg = Some(e),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if ui.button("Open Antennas").clicked() {
-                match utils::open_file_in_external_editor(&self.antenna_file_path) {
-                    Ok(_) => self.error_msg = None,
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-            if self.antennas.is_empty() {
-                ui.label("No antenna loaded");
-            } else {
-                self.selected_antenna = self.selected_antenna.min(self.antennas.len() - 1);
-                let old_selected_antenna = self.selected_antenna;
-                egui::ComboBox::from_id_source("skd_antenna")
-                    .selected_text(&self.antennas[self.selected_antenna].name)
-                    .show_ui(ui, |ui| {
-                        for (i, antenna) in self.antennas.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut self.selected_antenna,
-                                i,
-                                format!("{} {}", antenna.code, antenna.name),
-                            );
-                        }
-                    });
-                if self.selected_antenna != old_selected_antenna {
-                    self.mark_skd_status_dirty();
-                }
-                let antenna = &self.antennas[self.selected_antenna];
-                ui.label(format!(
-                    "AZ {:.1}-{:.1} {:.1}/min, EL {:.1}-{:.1} {:.1}/min",
-                    antenna.az_min_deg,
-                    antenna.az_max_deg,
-                    antenna.az_rate_deg_per_min,
-                    antenna.el_min_deg,
-                    antenna.el_max_deg,
-                    antenna.el_rate_deg_per_min
-                ));
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Schedule Date:");
-            if ui
-                .button(self.selected_date.format("%Y-%m-%d").to_string())
-                .clicked()
-            {
-                self.show_calendar = !self.show_calendar;
-            }
-            ui.separator();
-            ui.label("Time Shift:");
-            ui.add(
-                egui::DragValue::new(&mut self.schedule_time_shift_sec)
-                    .speed(1)
-                    .suffix(" s"),
-            );
-            if ui.button("Apply to All").clicked() {
-                match self.apply_schedule_time_shift() {
-                    Ok(_) => {
-                        self.error_msg = Some(format!(
-                            "Shifted all scans by {} seconds.",
-                            self.schedule_time_shift_sec
-                        ))
-                    }
-                    Err(e) => self.error_msg = Some(e),
-                }
-            }
-        });
-
-        if self.sources.is_empty() {
-            ui.label("Load source.txt first");
-        } else {
-            self.interleave_target_index = self.interleave_target_index.min(self.sources.len() - 1);
-            self.interleave_cal_index = self.interleave_cal_index.min(self.sources.len() - 1);
-            ui.group(|ui| {
-                ui.label("Target / Gain Calibrator");
-                ui.horizontal(|ui| {
-                    ui.label("Target:");
-                    ui.monospace(&self.sources[self.interleave_target_index].0.name);
-                    if ui.button("Select Target").clicked() {
-                        self.target_picker_open = true;
-                    }
-                    ui.label("Gain Cal:");
-                    ui.monospace(&self.sources[self.interleave_cal_index].0.name);
-                    if ui.button("Select Gain Cal").clicked() {
-                        self.cal_picker_open = true;
-                    }
-                    ui.label("Start UT:");
-                    ui.text_edit_singleline(&mut self.interleave_start_time);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Cal Dur:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.interleave_cal_duration_sec)
-                            .speed(10)
-                            .clamp_range(1..=86400)
-                            .suffix(" s"),
-                    );
-                    ui.label("Target Dur:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.interleave_target_duration_sec)
-                            .speed(10)
-                            .clamp_range(1..=86400)
-                            .suffix(" s"),
-                    );
-                    ui.label("Slew:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.interleave_slew_sec)
-                            .speed(10)
-                            .clamp_range(0..=86400)
-                            .suffix(" s"),
-                    );
-                    ui.label("Cycles:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.interleave_cycles)
-                            .speed(1)
-                            .clamp_range(1..=1000),
-                    );
-                    ui.checkbox(&mut self.interleave_clear_existing, "Replace table");
-                    if ui.button("Generate").clicked() {
-                        match self.generate_interleaved_skd_rows() {
-                            Ok(_) => self.error_msg = None,
-                            Err(e) => self.error_msg = Some(e),
-                        }
-                    }
-                });
-            });
-
-            ui.group(|ui| {
-                self.five_point_cal_index = self.five_point_cal_index.min(self.sources.len() - 1);
-                ui.label("Five-point Observation");
-                ui.horizontal(|ui| {
-                    ui.label("Gain Cal:");
-                    ui.monospace(&self.sources[self.five_point_cal_index].0.name);
-                    if ui.button("Select Five-point Cal").clicked() {
-                        self.five_point_picker_open = true;
-                    }
-                    ui.label("Start UT:");
-                    ui.text_edit_singleline(&mut self.five_point_start_time);
-                    ui.label("Obs Time:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.five_point_obstime_sec)
-                            .speed(10)
-                            .clamp_range(1..=86400)
-                            .suffix(" s"),
-                    );
-                    ui.label("Slew:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.five_point_slew_sec)
-                            .speed(10)
-                            .clamp_range(0..=86400)
-                            .suffix(" s"),
-                    );
-                    ui.label("Offset:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.five_point_offset_deg)
-                            .speed(0.1)
-                            .suffix(" arcmin"),
-                    );
-                    ui.checkbox(&mut self.five_point_clear_existing, "Replace table");
-                    if ui.button("Generate 10 Scans").clicked() {
-                        match self.generate_five_point_skd_rows() {
-                            Ok(_) => self.error_msg = None,
-                            Err(e) => self.error_msg = Some(e),
-                        }
-                    }
-                });
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("New Row:");
-                self.new_skd_source_index = self.new_skd_source_index.min(self.sources.len() - 1);
-                egui::ComboBox::from_id_source("new_skd_source")
-                    .selected_text(&self.sources[self.new_skd_source_index].0.name)
-                    .show_ui(ui, |ui| {
-                        for (i, (source, _)) in self.sources.iter().enumerate() {
-                            ui.selectable_value(&mut self.new_skd_source_index, i, &source.name);
-                        }
-                    });
-                ui.text_edit_singleline(&mut self.new_skd_start_time);
-                ui.add(
-                    egui::DragValue::new(&mut self.new_skd_duration_sec)
-                        .speed(10)
-                        .clamp_range(1..=86400)
-                        .suffix(" s"),
-                );
-                if ui.button("Add").clicked() {
-                    if parse_time_string(&self.new_skd_start_time).is_ok() {
-                        self.skd_rows.push(SkdRow {
-                            source_name: self.sources[self.new_skd_source_index].0.name.clone(),
-                            start_date: self.selected_date,
-                            start_time: normalize_time_string(&self.new_skd_start_time)
-                                .unwrap_or_else(|| self.new_skd_start_time.clone()),
-                            duration_sec: self.new_skd_duration_sec,
-                            az_offset_deg: 0.0,
-                            el_offset_deg: 0.0,
-                            ra_offset_deg: 0.0,
-                            dec_offset_deg: 0.0,
-                        });
-                        self.sort_skd_rows_by_start_time();
-                        self.error_msg = None;
-                    } else {
-                        self.error_msg = Some("Start time must be HH:MM:SS or HHMMSS.".to_string());
-                    }
-                }
-            });
-        }
-
-        self.rebuild_skd_status_cache();
-        ui.separator();
-        let mut remove_idx = None;
-        let mut table_changed = false;
-        ui.horizontal(|ui| {
-            ui.label("#");
-            ui.add_sized([150.0, 20.0], egui::Label::new("Source"));
-            ui.add_sized([90.0, 20.0], egui::Label::new("Date"));
-            ui.add_sized([90.0, 20.0], egui::Label::new("Start UT"));
-            ui.add_sized([95.0, 20.0], egui::Label::new("Duration"));
-            ui.add_sized([100.0, 20.0], egui::Label::new("AZ off"));
-            ui.add_sized([100.0, 20.0], egui::Label::new("EL off"));
-            ui.add_sized([80.0, 20.0], egui::Label::new("RA off"));
-            ui.add_sized([80.0, 20.0], egui::Label::new("Dec off"));
-            ui.add_sized([170.0, 20.0], egui::Label::new("Az/El deg"));
-            ui.add_sized([190.0, 20.0], egui::Label::new("Antenna"));
-        });
-        egui::ScrollArea::vertical().show_rows(ui, 34.0, self.skd_rows.len(), |ui, row_range| {
-            for i in row_range {
-                let status = self.skd_status_cache.get(i).cloned().unwrap_or(SkdRowStatus {
-                    geometry: "...".to_string(),
-                    motion: "...".to_string(),
-                });
-                let scan_geometry = status.geometry;
-                let motion_check = status.motion;
-                ui.horizontal(|ui| {
-                    ui.add_sized([24.0, 20.0], egui::Label::new((i + 1).to_string()));
-                    let selected_source = self.skd_rows[i].source_name.clone();
-                    egui::ComboBox::from_id_source(format!("skd_source_{}", i))
-                        .width(145.0)
-                        .selected_text(selected_source)
-                        .show_ui(ui, |ui| {
-                            for (source, _) in &self.sources {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.skd_rows[i].source_name,
-                                        source.name.clone(),
-                                        &source.name,
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("skd_left_parameters")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.group(|ui| {
+                                ui.set_min_width(parameter_panel_width);
+                                ui.set_max_width(parameter_panel_width);
+                                ui.label("Input DRG");
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Load DRG").clicked() {
+                                        match pick_file_dialog("Select DRG file") {
+                                            Ok(Some(path)) => {
+                                                self.input_drg_file_path =
+                                                    path.to_string_lossy().to_string();
+                                                match self.load_drg_file() {
+                                                    Ok(_) => {
+                                                        self.error_msg =
+                                                            Some("Loaded DRG.".to_string())
+                                                    }
+                                                    Err(e) => self.error_msg = Some(e),
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    if ui.button("Open Input").clicked() {
+                                        let input_path = output_drg_path(&self.input_drg_file_path)
+                                            .map(|path| path.to_string_lossy().to_string());
+                                        match input_path.and_then(|path| {
+                                            utils::open_file_in_external_editor(&path)
+                                        }) {
+                                            Ok(_) => self.error_msg = None,
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    let input_drg_path_text = if self.input_drg_file_path.is_empty()
+                                    {
+                                        "<DRG path>"
+                                    } else {
+                                        self.input_drg_file_path.as_str()
+                                    };
+                                    ui.add_sized(
+                                        [parameter_panel_width, 20.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(input_drg_path_text).monospace(),
+                                        )
+                                        .truncate(),
                                     )
-                                    .changed()
-                                {
-                                    table_changed = true;
+                                    .on_hover_text(input_drg_path_text);
+                                });
+                            });
+
+                            ui.group(|ui| {
+                                ui.set_min_width(parameter_panel_width);
+                                ui.set_max_width(parameter_panel_width);
+                                ui.label("Output");
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Obscode:");
+                                    ui.add_sized(
+                                        [120.0, 20.0],
+                                        egui::TextEdit::singleline(&mut self.obs_code),
+                                    );
+                                    ui.label("PI:");
+                                    ui.add_sized(
+                                        [120.0, 20.0],
+                                        egui::TextEdit::singleline(&mut self.pi_name),
+                                    );
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Create DRG").clicked() {
+                                        match self.write_skd_to_drg() {
+                                            Ok(paths) => {
+                                                self.error_msg = Some(format!(
+                                                    "Created {}",
+                                                    paths
+                                                        .iter()
+                                                        .map(|path| path.display().to_string())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                ))
+                                            }
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    if ui.button("Open DRG").clicked() {
+                                        let output_path = self
+                                            .obs_code_output_path(self.obs_code.trim())
+                                            .map(|path| path.to_string_lossy().to_string());
+                                        match output_path.and_then(|path| {
+                                            utils::open_file_in_external_editor(&path)
+                                        }) {
+                                            Ok(_) => self.error_msg = None,
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    match (
+                                        self.obs_code_output_path(self.obs_code.trim()),
+                                        self.obs_code_station_skd_output_path(
+                                            self.obs_code.trim(),
+                                            "32",
+                                        ),
+                                        self.obs_code_station_skd_output_path(
+                                            self.obs_code.trim(),
+                                            "34",
+                                        ),
+                                    ) {
+                                        (Ok(drg_path), Ok(skd32_path), Ok(skd34_path)) => {
+                                            let output_path_text = format!(
+                                                "{} | {} | {}",
+                                                drg_path.display(),
+                                                skd32_path.display(),
+                                                skd34_path.display()
+                                            );
+                                            ui.add_sized(
+                                                [parameter_panel_width, 20.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new(output_path_text.as_str())
+                                                        .monospace(),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(output_path_text);
+                                        }
+                                        _ => {
+                                            ui.add_sized(
+                                                [parameter_panel_width, 20.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new("<DRG/SKD>").monospace(),
+                                                )
+                                                .truncate(),
+                                            );
+                                        }
+                                    }
+                                });
+                            });
+
+                            ui.group(|ui| {
+                                ui.set_min_width(parameter_panel_width);
+                                ui.set_max_width(parameter_panel_width);
+                                ui.label("Source List");
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Load Sources").clicked() {
+                                        match pick_file_dialog("Select source.txt") {
+                                            Ok(Some(path)) => {
+                                                self.source_file_path =
+                                                    path.to_string_lossy().to_string();
+                                                match self.load_sources() {
+                                                    Ok(_) => self.error_msg = None,
+                                                    Err(e) => self.error_msg = Some(e),
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    if ui.button("Open Sources").clicked() {
+                                        match utils::open_file_in_external_editor(
+                                            &self.source_file_path,
+                                        ) {
+                                            Ok(_) => self.error_msg = None,
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    ui.label(format!("{} sources", self.sources.len()));
+                                    ui.add_sized(
+                                        [parameter_panel_width, 20.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(self.source_file_path.as_str())
+                                                .monospace(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(self.source_file_path.as_str());
+                                });
+                            });
+
+                            ui.group(|ui| {
+                                ui.set_min_width(parameter_panel_width);
+                                ui.set_max_width(parameter_panel_width);
+                                ui.label("Antenna SCH");
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Load Antennas").clicked() {
+                                        match pick_file_dialog("Select antenna.sch") {
+                                            Ok(Some(path)) => {
+                                                self.antenna_file_path =
+                                                    path.to_string_lossy().to_string();
+                                                match self.load_antennas() {
+                                                    Ok(_) => self.error_msg = None,
+                                                    Err(e) => self.error_msg = Some(e),
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    if ui.button("Open Antennas").clicked() {
+                                        match utils::open_file_in_external_editor(
+                                            &self.antenna_file_path,
+                                        ) {
+                                            Ok(_) => self.error_msg = None,
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                    ui.add_sized(
+                                        [parameter_panel_width, 20.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(self.antenna_file_path.as_str())
+                                                .monospace(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(self.antenna_file_path.as_str());
+                                });
+                                if self.antennas.is_empty() {
+                                    ui.label("No antenna loaded");
+                                } else {
+                                    self.selected_antenna =
+                                        self.selected_antenna.min(self.antennas.len() - 1);
+                                    self.selected_antenna_2 =
+                                        self.selected_antenna_2.min(self.antennas.len() - 1);
+                                    let old_selected_antenna = self.selected_antenna;
+                                    let old_selected_antenna_2 = self.selected_antenna_2;
+                                    for (selected, combo_id) in [
+                                        (&mut self.selected_antenna, "skd_antenna_1"),
+                                        (&mut self.selected_antenna_2, "skd_antenna_2"),
+                                    ] {
+                                        ui.horizontal_wrapped(|ui| {
+                                            egui::ComboBox::from_id_salt(combo_id)
+                                                .selected_text(&self.antennas[*selected].name)
+                                                .show_ui(ui, |ui| {
+                                                    for (i, antenna) in
+                                                        self.antennas.iter().enumerate()
+                                                    {
+                                                        ui.selectable_value(
+                                                            selected,
+                                                            i,
+                                                            format!(
+                                                                "{} {}",
+                                                                antenna.code, antenna.name
+                                                            ),
+                                                        );
+                                                    }
+                                                });
+                                            let antenna = &self.antennas[*selected];
+                                            ui.label(format!(
+                                        "AZ {:.1}-{:.1} {:.1}/min, EL {:.1}-{:.1} {:.1}/min",
+                                        antenna.az_min_deg,
+                                        antenna.az_max_deg,
+                                        antenna.az_rate_deg_per_min,
+                                        antenna.el_min_deg,
+                                        antenna.el_max_deg,
+                                        antenna.el_rate_deg_per_min
+                                    ));
+                                        });
+                                    }
+                                    if self.selected_antenna != old_selected_antenna
+                                        || self.selected_antenna_2 != old_selected_antenna_2
+                                    {
+                                        self.mark_skd_status_dirty();
+                                    }
                                 }
+                            });
+
+                            ui.group(|ui| {
+                                ui.set_min_width(parameter_panel_width);
+                                ui.set_max_width(parameter_panel_width);
+                                ui.label("Schedule Date / Time Shift");
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .button(self.selected_date.format("%Y-%m-%d").to_string())
+                                        .clicked()
+                                    {
+                                        self.show_calendar = !self.show_calendar;
+                                    }
+                                    ui.label("Time Shift:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.schedule_time_shift_sec)
+                                            .speed(1)
+                                            .suffix(" s"),
+                                    );
+                                    if ui.button("Apply to All").clicked() {
+                                        match self.apply_schedule_time_shift() {
+                                            Ok(_) => {
+                                                self.error_msg = Some(format!(
+                                                    "Shifted all scans by {} seconds.",
+                                                    self.schedule_time_shift_sec
+                                                ))
+                                            }
+                                            Err(e) => self.error_msg = Some(e),
+                                        }
+                                    }
+                                });
+                            });
+
+                            if self.sources.is_empty() {
+                                ui.label("Load source.txt first");
+                            } else {
+                                ui.group(|ui| {
+                                    ui.set_min_width(parameter_panel_width);
+                                    ui.set_max_width(parameter_panel_width);
+                                    self.interleave_target_index =
+                                        self.interleave_target_index.min(self.sources.len() - 1);
+                                    self.interleave_cal_index =
+                                        self.interleave_cal_index.min(self.sources.len() - 1);
+                                    ui.label("Target / Gain Calibrator");
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Target:");
+                                        ui.monospace(
+                                            &self.sources[self.interleave_target_index].0.name,
+                                        );
+                                        if ui.button("Select Target").clicked() {
+                                            self.target_picker_open = true;
+                                        }
+                                        ui.label("Target Dur:");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.interleave_target_duration_sec,
+                                            )
+                                            .speed(10)
+                                            .range(1..=86400)
+                                            .suffix(" s"),
+                                        );
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Gain Cal:");
+                                        ui.monospace(
+                                            &self.sources[self.interleave_cal_index].0.name,
+                                        );
+                                        if ui.button("Select Gain Cal").clicked() {
+                                            self.cal_picker_open = true;
+                                        }
+                                        ui.label("Calib Dur:");
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut self.interleave_cal_duration_sec,
+                                            )
+                                            .speed(10)
+                                            .range(1..=86400)
+                                            .suffix(" s"),
+                                        );
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Start UT:");
+                                        ui.add_sized(
+                                            [86.0, 20.0],
+                                            egui::TextEdit::singleline(
+                                                &mut self.interleave_start_time,
+                                            ),
+                                        );
+                                        ui.label("Slew:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.interleave_slew_sec)
+                                                .speed(10)
+                                                .range(0..=86400)
+                                                .suffix(" s"),
+                                        );
+                                        ui.label("Cycle:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.interleave_cycles)
+                                                .speed(1)
+                                                .range(1..=1000),
+                                        );
+                                        ui.checkbox(
+                                            &mut self.interleave_clear_existing,
+                                            "Replace table",
+                                        );
+                                        if ui.button("Generate").clicked() {
+                                            match self.generate_interleaved_skd_rows() {
+                                                Ok(_) => self.error_msg = None,
+                                                Err(e) => self.error_msg = Some(e),
+                                            }
+                                        }
+                                    });
+                                });
+
+                                ui.group(|ui| {
+                                    ui.set_min_width(parameter_panel_width);
+                                    ui.set_max_width(parameter_panel_width);
+                                    self.five_point_cal_index =
+                                        self.five_point_cal_index.min(self.sources.len() - 1);
+                                    ui.label("Five-point Observation");
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Gain Cal:");
+                                        ui.monospace(
+                                            &self.sources[self.five_point_cal_index].0.name,
+                                        );
+                                        if ui.button("Select Five-point Cal").clicked() {
+                                            self.five_point_picker_open = true;
+                                        }
+                                        ui.label("Start UT:");
+                                        ui.add_sized(
+                                            [86.0, 20.0],
+                                            egui::TextEdit::singleline(
+                                                &mut self.five_point_start_time,
+                                            ),
+                                        );
+                                        ui.label("Obs Time:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.five_point_obstime_sec)
+                                                .speed(10)
+                                                .range(1..=86400)
+                                                .suffix(" s"),
+                                        );
+                                        ui.label("Slew:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.five_point_slew_sec)
+                                                .speed(10)
+                                                .range(0..=86400)
+                                                .suffix(" s"),
+                                        );
+                                        ui.label("Offset:");
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.five_point_offset_deg)
+                                                .speed(0.1)
+                                                .suffix(" arcmin"),
+                                        );
+                                        ui.checkbox(
+                                            &mut self.five_point_include_station_offsets,
+                                            "Include 32/34 +/-2 arcmin",
+                                        );
+                                        ui.checkbox(
+                                            &mut self.five_point_clear_existing,
+                                            "Replace table",
+                                        );
+                                        if ui.button("Generate 10 Scans").clicked() {
+                                            match self.generate_five_point_skd_rows() {
+                                                Ok(_) => self.error_msg = None,
+                                                Err(e) => self.error_msg = Some(e),
+                                            }
+                                        }
+                                    });
+                                });
+
+                                ui.group(|ui| {
+                                    ui.set_min_width(parameter_panel_width);
+                                    ui.set_max_width(parameter_panel_width);
+                                    ui.label("New Row");
+                                    self.new_skd_source_index =
+                                        self.new_skd_source_index.min(self.sources.len() - 1);
+                                    ui.horizontal_wrapped(|ui| {
+                                        egui::ComboBox::from_id_salt("new_skd_source")
+                                            .selected_text(
+                                                &self.sources[self.new_skd_source_index].0.name,
+                                            )
+                                            .show_ui(ui, |ui| {
+                                                for (i, (source, _)) in
+                                                    self.sources.iter().enumerate()
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut self.new_skd_source_index,
+                                                        i,
+                                                        &source.name,
+                                                    );
+                                                }
+                                            });
+                                        ui.add_sized(
+                                            [86.0, 20.0],
+                                            egui::TextEdit::singleline(
+                                                &mut self.new_skd_start_time,
+                                            ),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(&mut self.new_skd_duration_sec)
+                                                .speed(10)
+                                                .range(1..=86400)
+                                                .suffix(" s"),
+                                        );
+                                        if ui.button("Add").clicked() {
+                                            if parse_time_string(&self.new_skd_start_time).is_ok() {
+                                                self.skd_rows.push(SkdRow {
+                                                    source_name: self.sources
+                                                        [self.new_skd_source_index]
+                                                        .0
+                                                        .name
+                                                        .clone(),
+                                                    start_date: self.selected_date,
+                                                    start_time: normalize_time_string(
+                                                        &self.new_skd_start_time,
+                                                    )
+                                                    .unwrap_or_else(|| {
+                                                        self.new_skd_start_time.clone()
+                                                    }),
+                                                    duration_sec: self.new_skd_duration_sec,
+                                                    az_offset_deg: 0.0,
+                                                    el_offset_deg: 0.0,
+                                                    ra_offset_deg: 0.0,
+                                                    dec_offset_deg: 0.0,
+                                                    include_station_offsets: false,
+                                                });
+                                                self.sort_skd_rows_by_start_time();
+                                                self.error_msg = None;
+                                            } else {
+                                                self.error_msg = Some(
+                                                    "Start time must be HH:MM:SS or HHMMSS."
+                                                        .to_string(),
+                                                );
+                                            }
+                                        }
+                                    });
+                                });
                             }
                         });
-                    ui.add_sized(
-                        [90.0, 20.0],
-                        egui::Label::new(self.skd_rows[i].start_date.format("%Y-%m-%d").to_string()),
-                    );
-                    if ui
-                        .add_sized(
-                            [90.0, 20.0],
-                            egui::TextEdit::singleline(&mut self.skd_rows[i].start_time),
-                        )
-                        .changed()
-                    {
-                        table_changed = true;
+                },
+            );
+
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_width, available.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    self.rebuild_skd_status_cache();
+                    let mut remove_idx = None;
+                    let mut table_changed = false;
+                    egui::ScrollArea::both()
+                        .id_salt("skd_schedule_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(SKD_TABLE_MIN_WIDTH);
+                            ui.horizontal(|ui| {
+                                show_table_text_cell(ui, SKD_COL_NUM, 18.0, "#");
+                                show_table_text_cell(ui, SKD_COL_SOURCE, 18.0, "Source");
+                                show_table_text_cell(ui, SKD_COL_DATE, 18.0, "Date");
+                                show_table_text_cell(ui, SKD_COL_TIME, 18.0, "Start UT");
+                                show_table_text_cell(ui, SKD_COL_DURATION, 18.0, "Duration");
+                                show_table_text_cell(ui, SKD_COL_AZEL, 18.0, "Start Az/El");
+                                show_table_text_cell(ui, SKD_COL_AZEL, 18.0, "End Az/El");
+                                show_table_text_cell(ui, SKD_COL_ANTENNA, 18.0, "Antenna 1");
+                                show_table_text_cell(ui, SKD_COL_ANTENNA, 18.0, "Antenna 2");
+                                show_table_text_cell(ui, SKD_COL_DELETE, 18.0, "");
+                            });
+                            ui.horizontal(|ui| {
+                                show_table_text_cell(ui, SKD_COL_NUM, 16.0, "");
+                                show_table_text_cell(ui, SKD_COL_SOURCE, 16.0, "");
+                                show_table_text_cell(ui, SKD_COL_DATE, 16.0, "YYYY-MM-DD");
+                                show_table_text_cell(ui, SKD_COL_TIME, 16.0, "hh:mm:ss");
+                                show_table_text_cell(ui, SKD_COL_DURATION, 16.0, "s");
+                                show_table_text_cell(ui, SKD_COL_AZEL, 16.0, "deg");
+                                show_table_text_cell(ui, SKD_COL_AZEL, 16.0, "deg");
+                                show_table_text_cell(ui, SKD_COL_ANTENNA, 16.0, "limits / slew");
+                                show_table_text_cell(ui, SKD_COL_ANTENNA, 16.0, "limits / slew");
+                                show_table_text_cell(ui, SKD_COL_DELETE, 16.0, "");
+                            });
+                            ui.separator();
+
+                            for i in 0..self.skd_rows.len() {
+                                let status =
+                                    self.skd_status_cache
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(SkdRowStatus {
+                                            start_geometry: "...".to_string(),
+                                            end_geometry: "...".to_string(),
+                                            motion_1: "...".to_string(),
+                                            motion_2: "...".to_string(),
+                                        });
+                                let start_geometry = status.start_geometry;
+                                let end_geometry = status.end_geometry;
+                                let motion_check_1 = status.motion_1;
+                                let motion_check_2 = status.motion_2;
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [SKD_COL_NUM, 20.0],
+                                        egui::Label::new((i + 1).to_string()),
+                                    );
+                                    let selected_source = self.skd_rows[i].source_name.clone();
+                                    egui::ComboBox::from_id_salt(format!("skd_source_{}", i))
+                                        .width(SKD_COL_SOURCE)
+                                        .selected_text(source_table_text(&selected_source))
+                                        .show_ui(ui, |ui| {
+                                            for (source, _) in &self.sources {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut self.skd_rows[i].source_name,
+                                                        source.name.clone(),
+                                                        &source.name,
+                                                    )
+                                                    .changed()
+                                                {
+                                                    table_changed = true;
+                                                }
+                                            }
+                                        });
+                                    ui.add_sized(
+                                        [SKD_COL_DATE, 20.0],
+                                        egui::Label::new(
+                                            self.skd_rows[i]
+                                                .start_date
+                                                .format("%Y-%m-%d")
+                                                .to_string(),
+                                        ),
+                                    );
+                                    if ui
+                                        .add_sized(
+                                            [SKD_COL_TIME, 20.0],
+                                            egui::TextEdit::singleline(
+                                                &mut self.skd_rows[i].start_time,
+                                            ),
+                                        )
+                                        .changed()
+                                    {
+                                        table_changed = true;
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            [SKD_COL_DURATION, 20.0],
+                                            egui::DragValue::new(
+                                                &mut self.skd_rows[i].duration_sec,
+                                            )
+                                            .speed(10)
+                                            .range(1..=86400),
+                                        )
+                                        .changed()
+                                    {
+                                        table_changed = true;
+                                    }
+                                    ui.add_sized(
+                                        [SKD_COL_AZEL, 20.0],
+                                        egui::Label::new(start_geometry),
+                                    )
+                                    .on_hover_text("Start AZ/EL");
+                                    ui.add_sized(
+                                        [SKD_COL_AZEL, 20.0],
+                                        egui::Label::new(end_geometry),
+                                    )
+                                    .on_hover_text("End AZ/EL");
+                                    for motion_check in [motion_check_1, motion_check_2] {
+                                        show_motion_status_cell(ui, &motion_check).on_hover_text(
+                                            "Checks start/end AZ/EL limits and required slew time.",
+                                        );
+                                    }
+                                    if ui
+                                        .add_sized([SKD_COL_DELETE, 20.0], egui::Button::new("Del"))
+                                        .clicked()
+                                    {
+                                        remove_idx = Some(i);
+                                    }
+                                });
+                            }
+                        });
+                    if let Some(i) = remove_idx {
+                        self.skd_rows.remove(i);
+                        self.mark_skd_status_dirty();
+                    } else if table_changed {
+                        self.mark_skd_status_dirty();
                     }
-                    if ui
-                        .add_sized(
-                            [95.0, 20.0],
-                            egui::DragValue::new(&mut self.skd_rows[i].duration_sec)
-                                .speed(10)
-                                .clamp_range(1..=86400)
-                                .suffix(" s"),
-                        )
-                        .changed()
-                    {
-                        table_changed = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [100.0, 20.0],
-                            egui::DragValue::new(&mut self.skd_rows[i].az_offset_deg)
-                                .speed(0.1)
-                                .suffix(" arcmin"),
-                        )
-                        .changed()
-                    {
-                        table_changed = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [100.0, 20.0],
-                            egui::DragValue::new(&mut self.skd_rows[i].el_offset_deg)
-                                .speed(0.1)
-                                .suffix(" arcmin"),
-                        )
-                        .changed()
-                    {
-                        table_changed = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [80.0, 20.0],
-                            egui::DragValue::new(&mut self.skd_rows[i].ra_offset_deg)
-                                .speed(0.001)
-                                .suffix(" deg"),
-                        )
-                        .changed()
-                    {
-                        table_changed = true;
-                    }
-                    if ui
-                        .add_sized(
-                            [80.0, 20.0],
-                            egui::DragValue::new(&mut self.skd_rows[i].dec_offset_deg)
-                                .speed(0.001)
-                                .suffix(" deg"),
-                        )
-                        .changed()
-                    {
-                        table_changed = true;
-                    }
-                    ui.add_sized([170.0, 20.0], egui::Label::new(scan_geometry))
-                        .on_hover_text("S = start AZ/EL, E = end AZ/EL");
-                    let check_color = if motion_check.contains("NG")
-                        || motion_check.contains("OVERLAP")
-                        || motion_check.contains("Bad")
-                    {
-                        egui::Color32::RED
-                    } else if motion_check.contains("Load") {
-                        egui::Color32::YELLOW
-                    } else {
-                        egui::Color32::GREEN
-                    };
-                    ui.add_sized(
-                        [190.0, 20.0],
-                        egui::Label::new(egui::RichText::new(motion_check).color(check_color)),
-                    )
-                    .on_hover_text("LIM checks start/end AZ/EL against antenna limits. SLW checks required slew time from previous scan end to this scan start.");
-                    if ui.button("Delete").clicked() {
-                        remove_idx = Some(i);
-                    }
-                });
-            }
+                },
+            );
         });
-        if let Some(i) = remove_idx {
-            self.skd_rows.remove(i);
-            self.mark_skd_status_dirty();
-        } else if table_changed {
-            self.mark_skd_status_dirty();
-        }
 
         self.show_source_picker_windows(ui.ctx());
 
@@ -1884,16 +2219,16 @@ impl UptimePlotApp {
             .width(ui.available_width())
             .height(ui.available_height() / 2.0)
             .y_axis_label("Azimuth (deg)")
-            .y_axis_width(4)
+            .y_axis_min_width(PLOT_Y_AXIS_MIN_WIDTH)
             .include_x(0.0)
             .include_x(24.0)
-            .include_y(0.0)
-            .include_y(360.0)
+            .include_y(-5.0)
+            .include_y(365.0)
             .allow_drag(false)
             .allow_zoom(false)
             .allow_scroll(false)
             .x_axis_label("") // Re-added
-            .x_axis_formatter(|_, _, _| "".to_string()) // Re-added
+            .x_axis_formatter(|_, _| "".to_string()) // Re-added
             .x_grid_spacer(|_input| {
                 [
                     0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
@@ -1918,7 +2253,7 @@ impl UptimePlotApp {
                 })
                 .collect::<Vec<_>>()
             })
-            .y_axis_formatter(|m, _, _| format!("{:.0}", m.value as i32))
+            .y_axis_formatter(|m, _| format!("{:.0}", m.value))
             .show_y(true)
             .coordinates_formatter(
                 Corner::LeftTop,
@@ -1933,11 +2268,11 @@ impl UptimePlotApp {
             .height(ui.available_height() / 2.0)
             .x_axis_label("Time (UT)")
             .y_axis_label("Elevation (deg)")
-            .y_axis_width(4)
+            .y_axis_min_width(PLOT_Y_AXIS_MIN_WIDTH)
             .include_x(0.0)
             .include_x(24.0)
             .include_y(0.0)
-            .include_y(90.0)
+            .include_y(91.0)
             .allow_drag(false)
             .allow_zoom(false)
             .allow_scroll(false)
@@ -1953,7 +2288,17 @@ impl UptimePlotApp {
                 })
                 .collect::<Vec<_>>()
             })
-            .x_axis_formatter(|m, _, _| format!("{:.0}", m.value as u32))
+            .y_grid_spacer(|_input| {
+                [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0]
+                    .into_iter()
+                    .map(|v| GridMark {
+                        value: v,
+                        step_size: 10.0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .x_axis_formatter(|m, _| format!("{:.0}", m.value as u32))
+            .y_axis_formatter(|m, _| format!("{:.0}", m.value))
             .show_x(true)
             .coordinates_formatter(
                 Corner::LeftTop,
@@ -1965,11 +2310,11 @@ impl UptimePlotApp {
 
         let az_response = plot_az.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                [0.0, 0.0],
-                [24.7, 360.0],
+                [0.0, -5.0],
+                [24.7, 365.0],
             ));
             for (name, az_points, _) in &self.plot_data {
-                plot_ui.line(Line::new(PlotPoints::from(az_points.clone())).name(name));
+                plot_ui.line(Line::new(name.clone(), PlotPoints::from(az_points.clone())));
             }
         });
 
@@ -1978,10 +2323,10 @@ impl UptimePlotApp {
         let el_response = plot_el.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                 [0.0, 0.0],
-                [24.7, 90.0],
+                [24.7, 91.0],
             ));
             for (name, _, el_points) in &self.plot_data {
-                plot_ui.line(Line::new(PlotPoints::from(el_points.clone())).name(name));
+                plot_ui.line(Line::new(name.clone(), PlotPoints::from(el_points.clone())));
             }
         });
 
@@ -2099,7 +2444,7 @@ impl UptimePlotApp {
                         ui.end_row();
 
                         ui.label("Search Filter:");
-                        ui.add(egui::TextEdit::singleline(&mut self.search_query).frame(true));
+                        ui.add(egui::TextEdit::singleline(&mut self.search_query));
                         ui.end_row();
                     });
 
@@ -2221,7 +2566,7 @@ impl UptimePlotApp {
                         circle_points.push([x, y]);
                     }
                     plot_ui.line(
-                        Line::new(PlotPoints::from(circle_points))
+                        Line::new("el_grid", PlotPoints::from(circle_points))
                             .stroke(egui::Stroke::new(2.0, egui::Color32::DARK_GRAY)),
                     );
 
@@ -2234,6 +2579,7 @@ impl UptimePlotApp {
                         let label_y = radius * (72.0f64).to_radians().sin();
                         plot_ui.text(
                             egui_plot::Text::new(
+                                "el_label",
                                 egui_plot::PlotPoint::new(label_x, label_y),
                                 label_text,
                             )
@@ -2249,31 +2595,38 @@ impl UptimePlotApp {
                 let x = 1.0 * angle_rad.cos();
                 let y = 1.0 * angle_rad.sin();
                 plot_ui.line(
-                    Line::new(PlotPoints::from(vec![[0.0, 0.0], [x, y]]))
+                    Line::new("az_grid", PlotPoints::from(vec![[0.0, 0.0], [x, y]]))
                         .stroke(egui::Stroke::new(2.0, egui::Color32::DARK_GRAY)),
                 );
 
                 // Add azimuth labels
                 let label_text = format!("{:.0}°", az_level);
                 plot_ui.text(
-                    egui_plot::Text::new(egui_plot::PlotPoint::new(x * 1.1, y * 1.1), label_text)
-                        .color(egui::Color32::DARK_GRAY),
+                    egui_plot::Text::new(
+                        "az_label",
+                        egui_plot::PlotPoint::new(x * 1.1, y * 1.1),
+                        label_text,
+                    )
+                    .color(egui::Color32::DARK_GRAY),
                 );
             }
 
             for (name, polar_points, hour_marker_points, hour_labels) in &self.polar_plot_data {
                 if !polar_points.is_empty() {
-                    plot_ui.points(
-                        Points::new(PlotPoints::from(polar_points.clone())).name(name.clone()),
-                    );
+                    plot_ui.points(Points::new(
+                        name.clone(),
+                        PlotPoints::from(polar_points.clone()),
+                    ));
                 }
                 if !hour_marker_points.is_empty() {
                     plot_ui.points(
-                        Points::new(PlotPoints::from(hour_marker_points.clone())).radius(3.5),
+                        Points::new("hour_markers", PlotPoints::from(hour_marker_points.clone()))
+                            .radius(3.5),
                     );
                     for (label_x, label_y, label_text) in hour_labels {
                         plot_ui.text(
                             egui_plot::Text::new(
+                                "hour_label",
                                 egui_plot::PlotPoint::new(*label_x, *label_y),
                                 label_text.clone(),
                             )
@@ -2303,16 +2656,16 @@ impl UptimePlotApp {
             .width(ui.available_width())
             .height(ui.available_height() / 2.0)
             .y_axis_label("Azimuth (deg)")
-            .y_axis_width(4)
+            .y_axis_min_width(PLOT_Y_AXIS_MIN_WIDTH)
             .include_x(0.0)
             .include_x(24.0)
-            .include_y(0.0)
-            .include_y(360.0)
+            .include_y(-5.0)
+            .include_y(365.0)
             .allow_drag(false)
             .allow_zoom(false)
             .allow_scroll(false)
             .x_axis_label("")
-            .x_axis_formatter(|_, _, _| "".to_string())
+            .x_axis_formatter(|_, _| "".to_string())
             .x_grid_spacer(|_input| {
                 [
                     0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
@@ -2337,7 +2690,7 @@ impl UptimePlotApp {
                 })
                 .collect::<Vec<_>>()
             })
-            .y_axis_formatter(|m, _, _| format!("{:.0}", m.value as i32))
+            .y_axis_formatter(|m, _| format!("{:.0}", m.value))
             .show_y(true)
             .coordinates_formatter(
                 Corner::LeftTop,
@@ -2352,11 +2705,11 @@ impl UptimePlotApp {
             .height(ui.available_height() / 2.0)
             .x_axis_label("Time (LST)")
             .y_axis_label("Elevation (deg)")
-            .y_axis_width(4)
+            .y_axis_min_width(PLOT_Y_AXIS_MIN_WIDTH)
             .include_x(0.0)
             .include_x(24.0)
             .include_y(0.0)
-            .include_y(90.0)
+            .include_y(91.0)
             .allow_drag(false)
             .allow_zoom(false)
             .allow_scroll(false)
@@ -2372,7 +2725,17 @@ impl UptimePlotApp {
                 })
                 .collect::<Vec<_>>()
             })
-            .x_axis_formatter(|m, _, _| format!("{:.0}", m.value as u32))
+            .y_grid_spacer(|_input| {
+                [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0]
+                    .into_iter()
+                    .map(|v| GridMark {
+                        value: v,
+                        step_size: 10.0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .x_axis_formatter(|m, _| format!("{:.0}", m.value as u32))
+            .y_axis_formatter(|m, _| format!("{:.0}", m.value))
             .show_x(true)
             .coordinates_formatter(
                 Corner::LeftTop,
@@ -2384,11 +2747,11 @@ impl UptimePlotApp {
 
         let az_response = plot_az.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                [0.0, 0.0],
-                [24.7, 360.0],
+                [0.0, -5.0],
+                [24.7, 365.0],
             ));
             for (name, az_points, _) in lst_plot_data {
-                plot_ui.line(Line::new(PlotPoints::from(az_points.clone())).name(name));
+                plot_ui.line(Line::new(name.clone(), PlotPoints::from(az_points.clone())));
             }
         });
 
@@ -2397,10 +2760,10 @@ impl UptimePlotApp {
         let el_response = plot_el.show(ui, |plot_ui| {
             plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                 [0.0, 0.0],
-                [24.7, 90.0],
+                [24.7, 91.0],
             ));
             for (name, _, el_points) in lst_plot_data {
-                plot_ui.line(Line::new(PlotPoints::from(el_points.clone())).name(name));
+                plot_ui.line(Line::new(name.clone(), PlotPoints::from(el_points.clone())));
             }
         });
 
@@ -2683,9 +3046,13 @@ fn build_simple_skd_content(
     content.push_str("$SKED\n");
     for (idx, row) in rows.iter().enumerate() {
         let start = format_drg_timestamp(row.start_date, &row.start_time)?;
-        let (az_offset, el_offset) = station_suffix
-            .and_then(|suffix| five_point_station_offset(suffix, idx))
-            .unwrap_or((row.az_offset_deg, row.el_offset_deg));
+        let (az_offset, el_offset) = if row.include_station_offsets {
+            station_suffix
+                .and_then(|suffix| five_point_station_offset(suffix, idx))
+                .unwrap_or((row.az_offset_deg, row.el_offset_deg))
+        } else {
+            (row.az_offset_deg, row.el_offset_deg)
+        };
         content.push_str(&format!(
             "{:<12} {} {:>6} {:>6} {:>4} {:>4} {:>4}\n",
             row.source_name,
@@ -2756,6 +3123,22 @@ fn parse_exper_code(content: &str) -> Option<String> {
         } else {
             None
         }
+    })
+}
+
+fn parse_pi_name(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let body = trimmed.strip_prefix('*').unwrap_or(trimmed).trim();
+        for prefix in ["P.I.:", "PI:", "P.I.", "PI"] {
+            if let Some(value) = body.strip_prefix(prefix) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
     })
 }
 
@@ -2962,7 +3345,11 @@ fn calendar_ui(ui: &mut egui::Ui, date: &mut NaiveDate) -> bool {
                 .with_day(1)
                 .unwrap_or(*date);
         }
-        ui.label(date.format("%Y - %B").to_string());
+        ui.label(format!(
+            "{}  DOY {:03}",
+            date.format("%Y - %B"),
+            date.ordinal()
+        ));
         if ui.button(">").clicked() {
             let (year, month) = if date.month() == 12 {
                 (date.year() + 1, 1)
@@ -3000,7 +3387,15 @@ fn calendar_ui(ui: &mut egui::Ui, date: &mut NaiveDate) -> bool {
             let is_selected = day_num == date.day();
             let button = egui::Button::new(day_num.to_string()).selected(is_selected);
 
-            if ui.add(button).clicked() {
+            if ui
+                .add(button)
+                .on_hover_text(format!(
+                    "{}  DOY {:03}",
+                    current_day.format("%Y-%m-%d"),
+                    current_day.ordinal()
+                ))
+                .clicked()
+            {
                 *date = NaiveDate::from_ymd_opt(year, month, day_num).unwrap();
                 changed = true;
             }
