@@ -191,9 +191,9 @@ impl Antenna {
         }
         let from_az = self.az_for_slew(from_az, None)?;
         let to_az = self.az_for_slew(to_az, Some(from_az))?;
-        let az_sec = (to_az - from_az).abs() / self.az_rate_deg_per_min * 60.0;
-        let el_sec = (to_el - from_el).abs() / self.el_rate_deg_per_min * 60.0;
-        Some(az_sec.max(el_sec))
+        let az_sec = (to_az - from_az).abs() / self.az_rate_deg_per_min * 60.0 + 5.0;
+        let el_sec = (to_el - from_el).abs() / self.el_rate_deg_per_min * 60.0 + 5.0;
+        Some(az_sec.max(el_sec) + 2.0)
     }
 }
 
@@ -2375,6 +2375,12 @@ impl UptimePlotApp {
                                     Err(e) => self.error_msg = Some(e),
                                 }
                             }
+                            if ui.button("Reload").clicked() {
+                                match self.load_stations() {
+                                    Ok(_) => self.error_msg = None,
+                                    Err(e) => self.error_msg = Some(e),
+                                }
+                            }
                             if ui.button("Open").clicked() {
                                 match utils::open_file_in_external_editor(&self.station_file_path) {
                                     Ok(_) => self.error_msg = None,
@@ -2431,6 +2437,12 @@ impl UptimePlotApp {
                                         }
                                     }
                                     Ok(None) => {}
+                                    Err(e) => self.error_msg = Some(e),
+                                }
+                            }
+                            if ui.button("Reload").clicked() {
+                                match self.load_sources() {
+                                    Ok(_) => self.error_msg = None,
                                     Err(e) => self.error_msg = Some(e),
                                 }
                             }
@@ -2566,7 +2578,7 @@ impl UptimePlotApp {
                         circle_points.push([x, y]);
                     }
                     plot_ui.line(
-                        Line::new("el_grid", PlotPoints::from(circle_points))
+                        Line::new("", PlotPoints::from(circle_points))
                             .stroke(egui::Stroke::new(2.0, egui::Color32::DARK_GRAY)),
                     );
 
@@ -2579,7 +2591,7 @@ impl UptimePlotApp {
                         let label_y = radius * (72.0f64).to_radians().sin();
                         plot_ui.text(
                             egui_plot::Text::new(
-                                "el_label",
+                                "",
                                 egui_plot::PlotPoint::new(label_x, label_y),
                                 label_text,
                             )
@@ -2595,7 +2607,7 @@ impl UptimePlotApp {
                 let x = 1.0 * angle_rad.cos();
                 let y = 1.0 * angle_rad.sin();
                 plot_ui.line(
-                    Line::new("az_grid", PlotPoints::from(vec![[0.0, 0.0], [x, y]]))
+                    Line::new("", PlotPoints::from(vec![[0.0, 0.0], [x, y]]))
                         .stroke(egui::Stroke::new(2.0, egui::Color32::DARK_GRAY)),
                 );
 
@@ -2603,7 +2615,7 @@ impl UptimePlotApp {
                 let label_text = format!("{:.0}°", az_level);
                 plot_ui.text(
                     egui_plot::Text::new(
-                        "az_label",
+                        "",
                         egui_plot::PlotPoint::new(x * 1.1, y * 1.1),
                         label_text,
                     )
@@ -2620,13 +2632,12 @@ impl UptimePlotApp {
                 }
                 if !hour_marker_points.is_empty() {
                     plot_ui.points(
-                        Points::new("hour_markers", PlotPoints::from(hour_marker_points.clone()))
-                            .radius(3.5),
+                        Points::new("", PlotPoints::from(hour_marker_points.clone())).radius(3.5),
                     );
                     for (label_x, label_y, label_text) in hour_labels {
                         plot_ui.text(
                             egui_plot::Text::new(
-                                "hour_label",
+                                "",
                                 egui_plot::PlotPoint::new(*label_x, *label_y),
                                 label_text.clone(),
                             )
@@ -3411,4 +3422,37 @@ fn calendar_ui(ui: &mut egui::Ui, date: &mut NaiveDate) -> bool {
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slew_seconds() {
+        let antenna = Antenna {
+            code: "TEST".to_string(),
+            name: "TEST".to_string(),
+            pos: [0.0, 0.0, 0.0],
+            az_rate_deg_per_min: 60.0, // 1 deg/sec
+            az_min_deg: -180.0,
+            az_max_deg: 180.0,
+            el_rate_deg_per_min: 30.0, // 0.5 deg/sec
+            el_min_deg: 0.0,
+            el_max_deg: 90.0,
+        };
+
+        // No movement: max(0/60*60 + 5, 0/30*60 + 5) + 2 = 7.0
+        assert_eq!(antenna.slew_seconds(0.0, 45.0, 0.0, 45.0), Some(7.0));
+
+        // AZ moves 10 deg: 10/60*60 = 10s. 10 + 5 = 15s.
+        // EL moves 0 deg: 0 + 5 = 5s.
+        // max(15, 5) + 2 = 17.0
+        assert_eq!(antenna.slew_seconds(0.0, 45.0, 10.0, 45.0), Some(17.0));
+
+        // AZ moves 0 deg: 0 + 5 = 5s.
+        // EL moves 10 deg: 10/30*60 = 20s. 20 + 5 = 25s.
+        // max(5, 25) + 2 = 27.0
+        assert_eq!(antenna.slew_seconds(0.0, 45.0, 0.0, 55.0), Some(27.0));
+    }
 }
