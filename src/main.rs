@@ -308,6 +308,7 @@ struct UptimePlotApp {
     skd_status_cache: Vec<SkdRowStatus>,
     skd_status_dirty: bool,
     new_skd_source_index: usize,
+    new_skd_start_date: NaiveDate,
     new_skd_start_time: String,
     new_skd_duration_sec: u32,
     interleave_target_index: usize,
@@ -342,6 +343,7 @@ struct UptimePlotApp {
     )>,
     error_msg: Option<String>,
     show_calendar: bool,
+    show_new_skd_calendar: bool,
     search_query: String,
     selected_tab: AppTab,
     uptime_plot_rect: Option<egui::Rect>,
@@ -425,6 +427,7 @@ impl UptimePlotApp {
             skd_status_cache: Vec::new(),
             skd_status_dirty: true,
             new_skd_source_index: 0,
+            new_skd_start_date: Utc::now().date_naive(),
             new_skd_start_time: "00:00:00".to_string(),
             new_skd_duration_sec: 240,
             interleave_target_index: 0,
@@ -454,6 +457,7 @@ impl UptimePlotApp {
             polar_plot_data: Vec::new(),
             error_msg: None,
             show_calendar: false,
+            show_new_skd_calendar: false,
             search_query: String::new(),
             selected_tab: AppTab::UptimePlotters,
             uptime_plot_rect: None,
@@ -471,6 +475,7 @@ impl eframe::App for UptimePlotApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.show_calendar_window(&ctx);
+        self.show_new_skd_calendar_window(&ctx);
 
         if let Some(image) = ctx.input(|i| {
             i.events.iter().find_map(|e| {
@@ -965,9 +970,28 @@ impl UptimePlotApp {
                 });
             if self.selected_tab == AppTab::SkdTable && self.selected_date != previous_date {
                 self.shift_skd_rows_by_days((self.selected_date - previous_date).num_days());
+                self.new_skd_start_date = self.selected_date;
             }
             if !open {
                 self.show_calendar = false;
+            }
+        }
+    }
+
+    fn show_new_skd_calendar_window(&mut self, ctx: &egui::Context) {
+        if self.show_new_skd_calendar {
+            let mut open = true;
+            egui::Window::new("Select Date for New Row")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if calendar_ui(ui, &mut self.new_skd_start_date) {
+                        self.show_new_skd_calendar = false;
+                    }
+                });
+            if !open {
+                self.show_new_skd_calendar = false;
             }
         }
     }
@@ -1905,6 +1929,14 @@ impl UptimePlotApp {
                                                     );
                                                 }
                                             });
+                                        if ui
+                                            .button(
+                                                self.new_skd_start_date.format("%Y-%m-%d").to_string(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.show_new_skd_calendar = !self.show_new_skd_calendar;
+                                        }
                                         ui.add_sized(
                                             [86.0, 20.0],
                                             egui::TextEdit::singleline(
@@ -1925,7 +1957,7 @@ impl UptimePlotApp {
                                                         .0
                                                         .name
                                                         .clone(),
-                                                    start_date: self.selected_date,
+                                                    start_date: self.new_skd_start_date,
                                                     start_time: normalize_time_string(
                                                         &self.new_skd_start_time,
                                                     )
