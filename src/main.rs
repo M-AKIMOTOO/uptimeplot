@@ -2027,29 +2027,27 @@ impl UptimePlotApp {
                             ui.separator();
 
                             for i in 0..self.skd_rows.len() {
-                                let status =
-                                    self.skd_status_cache
-                                        .get(i)
-                                        .cloned()
-                                        .unwrap_or(SkdRowStatus {
-                                            start_geometry: "...".to_string(),
-                                            end_geometry: "...".to_string(),
-                                            motion_1: "...".to_string(),
-                                            motion_2: "...".to_string(),
-                                        });
-                                let start_geometry = status.start_geometry;
-                                let end_geometry = status.end_geometry;
-                                let motion_check_1 = status.motion_1;
-                                let motion_check_2 = status.motion_2;
+                                let status = self.skd_status_cache.get(i);
+                                let (start_geometry, end_geometry, motion_check_1, motion_check_2) =
+                                    if let Some(s) = status {
+                                        (
+                                            s.start_geometry.as_str(),
+                                            s.end_geometry.as_str(),
+                                            s.motion_1.as_str(),
+                                            s.motion_2.as_str(),
+                                        )
+                                    } else {
+                                        ("...", "...", "...", "...")
+                                    };
                                 ui.horizontal(|ui| {
                                     ui.add_sized(
                                         [SKD_COL_NUM, 20.0],
                                         egui::Label::new((i + 1).to_string()),
                                     );
-                                    let selected_source = self.skd_rows[i].source_name.clone();
+                                    let selected_source = self.skd_rows[i].source_name.as_str();
                                     egui::ComboBox::from_id_salt(format!("skd_source_{}", i))
                                         .width(SKD_COL_SOURCE)
-                                        .selected_text(source_table_text(&selected_source))
+                                        .selected_text(source_table_text(selected_source))
                                         .show_ui(ui, |ui| {
                                             for (source, _) in &self.sources {
                                                 if ui
@@ -2108,7 +2106,7 @@ impl UptimePlotApp {
                                     )
                                     .on_hover_text("End AZ/EL");
                                     for motion_check in [motion_check_1, motion_check_2] {
-                                        show_motion_status_cell(ui, &motion_check).on_hover_text(
+                                        show_motion_status_cell(ui, motion_check).on_hover_text(
                                             "Checks start/end AZ/EL limits and required slew time.",
                                         );
                                     }
@@ -2224,27 +2222,28 @@ impl UptimePlotApp {
     fn ui_uptime_plotters_tab(&mut self, ui: &mut egui::Ui) {
         let station_pos = self.station_position();
         let selected_date = self.selected_date;
+
         let az_pointer_formatter = move |x: f64, y: f64| {
-            let ut_text = format!("UT: {}", format_hour_hms(x));
+            let ut_text = format_hour_hms(x);
             let lst_text = station_pos
                 .and_then(|pos| {
                     utc_datetime_from_hour(selected_date, x)
                         .map(|dt| utils::utc_to_lst_hours(pos, dt))
                 })
-                .map(|lst| format!("LST: {}", format_hour_hms(lst)))
-                .unwrap_or_else(|| "LST: N/A".to_string());
-            format!("{}\n{}\nAz: {:.1}°", ut_text, lst_text, y)
+                .map(format_hour_hms)
+                .unwrap_or_else(|| "N/A".to_string());
+            format!("UT: {}\nLST: {}\nAz: {:.1}°", ut_text, lst_text, y)
         };
         let el_pointer_formatter = move |x: f64, y: f64| {
-            let ut_text = format!("UT: {}", format_hour_hms(x));
+            let ut_text = format_hour_hms(x);
             let lst_text = station_pos
                 .and_then(|pos| {
                     utc_datetime_from_hour(selected_date, x)
                         .map(|dt| utils::utc_to_lst_hours(pos, dt))
                 })
-                .map(|lst| format!("LST: {}", format_hour_hms(lst)))
-                .unwrap_or_else(|| "LST: N/A".to_string());
-            format!("{}\n{}\nEl: {:.1}°", ut_text, lst_text, y)
+                .map(format_hour_hms)
+                .unwrap_or_else(|| "N/A".to_string());
+            format!("UT: {}\nLST: {}\nEl: {:.1}°", ut_text, lst_text, y)
         };
 
         let plot_az = Plot::new("az_plot")
@@ -2346,7 +2345,7 @@ impl UptimePlotApp {
                 [24.7, 365.0],
             ));
             for (name, az_points, _) in &self.plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(az_points.clone())));
+                plot_ui.line(Line::new(name, PlotPoints::from_iter(az_points.iter().copied())));
             }
         });
 
@@ -2358,7 +2357,7 @@ impl UptimePlotApp {
                 [24.7, 91.0],
             ));
             for (name, _, el_points) in &self.plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(el_points.clone())));
+                plot_ui.line(Line::new(name, PlotPoints::from_iter(el_points.iter().copied())));
             }
         });
 
