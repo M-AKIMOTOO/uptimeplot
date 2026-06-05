@@ -12,6 +12,20 @@ use std::path::{Path, PathBuf};
 
 mod utils;
 
+fn apply_station_line_style(line: Line, station_idx: usize) -> Line {
+    match station_idx % 4 {
+        0 => line.stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 0))), // Solid
+        1 => line
+            .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(200, 0, 0)))
+            .style(egui_plot::LineStyle::Dashed { length: 10.0 }),
+        2 => line
+            .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 0, 200)))
+            .style(egui_plot::LineStyle::Dotted { spacing: 5.0 }),
+        _ => line
+            .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(200, 200, 0))),
+    }
+}
+
 const PLOT_Y_AXIS_MIN_WIDTH: f32 = 96.0;
 
 const SKD_COL_NUM: f32 = 24.0;
@@ -97,6 +111,7 @@ fn main() -> Result<(), eframe::Error> {
 struct Station {
     name: String,
     pos: [f64; 3],
+    selected: bool,
 }
 
 #[derive(Clone)]
@@ -292,7 +307,6 @@ fn show_status_token(ui: &mut egui::Ui, token: &str, width: f32) {
 
 struct UptimePlotApp {
     stations: Vec<Station>,
-    selected_station: usize,
     selected_date: NaiveDate,
     station_file_path: String,
     source_file_path: String,
@@ -333,13 +347,15 @@ struct UptimePlotApp {
     target_picker_filter: String,
     cal_picker_filter: String,
     five_point_picker_filter: String,
-    plot_data: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
-    lst_plot_data: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
+    plot_data: Vec<(String, String, Vec<[f64; 2]>, Vec<[f64; 2]>, usize)>,
+    lst_plot_data: Vec<(String, String, Vec<[f64; 2]>, Vec<[f64; 2]>, usize)>,
     polar_plot_data: Vec<(
+        String,
         String,
         Vec<[f64; 2]>,
         Vec<[f64; 2]>,
         Vec<(f64, f64, String)>,
+        usize,
     )>,
     error_msg: Option<String>,
     show_calendar: bool,
@@ -388,6 +404,7 @@ impl UptimePlotApp {
                                 stations_vec.push(Station {
                                     name: parts[0].to_string(),
                                     pos: [pos_x, pos_y, pos_z],
+                                    selected: parts[0] == "YAMAGU32",
                                 });
                             }
                         }
@@ -397,18 +414,8 @@ impl UptimePlotApp {
             stations_vec
         };
 
-        let default_station_idx = if stations.is_empty() {
-            0 // Default to 0 if no stations loaded, or handle error
-        } else {
-            stations
-                .iter()
-                .position(|s| s.name == "YAMAGU32")
-                .unwrap_or(0)
-        };
-
         let mut app = Self {
             stations,
-            selected_station: default_station_idx,
             selected_date: Utc::now().date_naive(),
             station_file_path: station_file_path.to_str().unwrap_or_default().to_string(),
             source_file_path: source_file_path.to_str().unwrap_or_default().to_string(),
@@ -641,6 +648,7 @@ impl UptimePlotApp {
                     stations_vec.push(Station {
                         name: parts[0].to_string(),
                         pos: [pos_x, pos_y, pos_z],
+                        selected: parts[0] == "YAMAGU32",
                     });
                 } else {
                     return Err(format!("Invalid number format in station file: {}", line));
@@ -650,78 +658,86 @@ impl UptimePlotApp {
             }
         }
         self.stations = stations_vec;
-        // Reset selected_station if the current one is no longer valid
-        if self.selected_station >= self.stations.len() {
-            self.selected_station = 0;
-        }
         Ok(())
     }
 
     fn calculate_plots(&mut self) {
-        // println!("DEBUG: calculate_plots called.");
-        // println!("DEBUG: self.stations.len() = {}", self.stations.len());
-        // println!("DEBUG: self.selected_station = {}", self.selected_station);
-
         if self.stations.is_empty() {
             self.error_msg = Some("No stations loaded. Please check station.txt".to_string());
             return;
         }
 
-        let station = &self.stations[self.selected_station];
-        let ant_pos = station.pos;
         let mut new_plot_data = Vec::new();
+        let selected_stations: Vec<(usize, &Station)> = self
+            .stations
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.selected)
+            .collect();
 
-        for (source, selected) in &self.sources {
-            if !*selected {
-                continue;
-            }
+        if selected_stations.is_empty() {
+            self.error_msg = Some("No stations selected.".to_string());
+            return;
+        }
 
-            let mut full_day_points = Vec::new();
-            for i in (0..=(24 * 60)).step_by(3) {
-                // 3 minute intervals
-                let hour_float = (i as f64) / 60.0;
-                let h = (i / 60) as u32;
-                let m = (i % 60) as u32;
-
-                if let Some(time) = self.selected_date.and_hms_opt(h, m, 0) {
-                    let datetime_utc = Utc.from_utc_datetime(&time);
-                    let (az, el, _) =
-                        utils::radec2azalt(ant_pos, datetime_utc, source.ra_rad, source.dec_rad);
-                    full_day_points.push((hour_float, az, el));
-                }
-            }
-
-            let mut az_points = Vec::new();
-            let mut el_points = Vec::new();
-
-            if let Some(last_point) = full_day_points.get(0) {
-                if last_point.2 >= 0.0 {
-                    az_points.push([last_point.0, last_point.1]);
-                    el_points.push([last_point.0, last_point.2]);
+        for (station_idx, station) in selected_stations {
+            let ant_pos = station.pos;
+            for (source, selected) in &self.sources {
+                if !*selected {
+                    continue;
                 }
 
-                for &point in full_day_points.iter().skip(1) {
-                    let (hour, az, el) = point;
+                let mut full_day_points = Vec::new();
+                for i in (0..=(24 * 60)).step_by(3) {
+                    let hour_float = (i as f64) / 60.0;
+                    let h = (i / 60) as u32;
+                    let m = (i % 60) as u32;
 
-                    az_points.push([hour, az]);
-
-                    if el >= 0.0 {
-                        el_points.push([hour, el]);
-                    } else {
-                        el_points.push([hour, f64::NAN]);
+                    if let Some(time) = self.selected_date.and_hms_opt(h, m, 0) {
+                        let datetime_utc = Utc.from_utc_datetime(&time);
+                        let (az, el, _) =
+                            utils::radec2azalt(ant_pos, datetime_utc, source.ra_rad, source.dec_rad);
+                        full_day_points.push((hour_float, az, el));
                     }
                 }
+
+                let mut az_points = Vec::new();
+                let mut el_points = Vec::new();
+
+                if let Some(last_point) = full_day_points.get(0) {
+                    if last_point.2 >= 0.0 {
+                        az_points.push([last_point.0, last_point.1]);
+                        el_points.push([last_point.0, last_point.2]);
+                    }
+
+                    for &point in full_day_points.iter().skip(1) {
+                        let (hour, az, el) = point;
+                        az_points.push([hour, az]);
+                        if el >= 0.0 {
+                            el_points.push([hour, el]);
+                        } else {
+                            el_points.push([hour, f64::NAN]);
+                        }
+                    }
+                }
+                new_plot_data.push((
+                    source.name.clone(),
+                    station.name.clone(),
+                    az_points,
+                    el_points,
+                    station_idx,
+                ));
             }
-            new_plot_data.push((source.name.clone(), az_points, el_points));
         }
         self.plot_data = new_plot_data;
-        self.lst_plot_data = self.build_lst_plot_data(ant_pos);
+        self.lst_plot_data = self.build_lst_plot_data();
         self.polar_plot_data = self.build_polar_plot_data();
     }
 
     fn station_position(&self) -> Option<[f64; 3]> {
         self.stations
-            .get(self.selected_station)
+            .iter()
+            .find(|s| s.selected)
             .map(|station| station.pos)
     }
 
@@ -730,13 +746,17 @@ impl UptimePlotApp {
         Some(utils::utc_to_lst_hours(station_pos, datetime))
     }
 
-    fn build_lst_plot_data(
-        &self,
-        station_pos: [f64; 3],
-    ) -> Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)> {
+    fn build_lst_plot_data(&self) -> Vec<(String, String, Vec<[f64; 2]>, Vec<[f64; 2]>, usize)> {
         let mut lst_plot_data = Vec::new();
 
-        for (name, az_points, el_points) in &self.plot_data {
+        for (source_name, station_name, az_points, el_points, station_idx) in &self.plot_data {
+            let station_pos = self
+                .stations
+                .iter()
+                .find(|s| &s.name == station_name)
+                .map(|s| s.pos)
+                .unwrap_or([0.0, 0.0, 0.0]);
+
             let mut lst_az_points = Vec::new();
             let mut lst_el_points = Vec::new();
             let mut prev_lst: Option<f64> = None;
@@ -747,7 +767,6 @@ impl UptimePlotApp {
                 let el = el_points[i][1];
 
                 if let Some(lst_hour) = self.lst_from_ut_hour(station_pos, ut_hour) {
-                    // Break line at LST wrap (e.g., 23.9h -> 0.0h).
                     if let Some(prev) = prev_lst {
                         if lst_hour + 12.0 < prev {
                             lst_az_points.push([f64::NAN, f64::NAN]);
@@ -760,10 +779,14 @@ impl UptimePlotApp {
                     prev_lst = Some(lst_hour);
                 }
             }
-
-            lst_plot_data.push((name.clone(), lst_az_points, lst_el_points));
+            lst_plot_data.push((
+                source_name.clone(),
+                station_name.clone(),
+                lst_az_points,
+                lst_el_points,
+                *station_idx,
+            ));
         }
-
         lst_plot_data
     }
 
@@ -771,13 +794,15 @@ impl UptimePlotApp {
         &self,
     ) -> Vec<(
         String,
+        String,
         Vec<[f64; 2]>,
         Vec<[f64; 2]>,
         Vec<(f64, f64, String)>,
+        usize,
     )> {
         let mut polar_plot_data = Vec::new();
 
-        for (name, az_points, el_points) in &self.plot_data {
+        for (source_name, station_name, az_points, el_points, station_idx) in &self.plot_data {
             let mut polar_points = Vec::new();
             let mut hour_marker_points = Vec::new();
             let mut hour_labels = Vec::new();
@@ -806,10 +831,15 @@ impl UptimePlotApp {
                     }
                 }
             }
-
-            polar_plot_data.push((name.clone(), polar_points, hour_marker_points, hour_labels));
+            polar_plot_data.push((
+                source_name.clone(),
+                station_name.clone(),
+                polar_points,
+                hour_marker_points,
+                hour_labels,
+                *station_idx,
+            ));
         }
-
         polar_plot_data
     }
 
@@ -1006,22 +1036,19 @@ impl UptimePlotApp {
         let mut header = "Time".to_string();
         let mut time_points: Vec<f64> = Vec::new();
 
-        // Collect all unique time points and build header
-        for (i, (name, az_points, _)) in self.plot_data.iter().enumerate() {
-            header.push_str(&format!(",{},{}", name, name)); // Add source name twice for AZ and EL
+        for (i, (source_name, station_name, az_points, _, _)) in self.plot_data.iter().enumerate() {
+            let label = format!("{}_{}", source_name, station_name);
+            header.push_str(&format!(",{},{}", label, label));
             if i == 0 {
-                // Assuming time points are common for all sources
                 time_points = az_points.iter().map(|p| p[0]).collect();
             }
         }
         csv_content.push_str(&header);
         csv_content.push_str("\n");
 
-        // Populate data rows
         for &time in &time_points {
-            let mut row = format!("{:.2}", time); // Format time to 2 decimal places
-            for (_, az_points, el_points) in &self.plot_data {
-                // Find the corresponding az and el for this time
+            let mut row = format!("{:.2}", time);
+            for (_, _, az_points, el_points, _) in &self.plot_data {
                 let az_val = az_points
                     .iter()
                     .find(|p| (p[0] - time).abs() < 1e-6)
@@ -2344,8 +2371,13 @@ impl UptimePlotApp {
                 [0.0, -5.0],
                 [24.7, 365.0],
             ));
-            for (name, az_points, _) in &self.plot_data {
-                plot_ui.line(Line::new(name, PlotPoints::from_iter(az_points.iter().copied())));
+            for (source_name, station_name, az_points, _, station_idx) in &self.plot_data {
+                let mut line = Line::new(
+                    format!("{}:{}", source_name, station_name),
+                    PlotPoints::from_iter(az_points.iter().copied()),
+                );
+                line = apply_station_line_style(line, *station_idx);
+                plot_ui.line(line);
             }
         });
 
@@ -2356,8 +2388,13 @@ impl UptimePlotApp {
                 [0.0, 0.0],
                 [24.7, 91.0],
             ));
-            for (name, _, el_points) in &self.plot_data {
-                plot_ui.line(Line::new(name, PlotPoints::from_iter(el_points.iter().copied())));
+            for (source_name, station_name, _, el_points, station_idx) in &self.plot_data {
+                let mut line = Line::new(
+                    format!("{}:{}", source_name, station_name),
+                    PlotPoints::from_iter(el_points.iter().copied()),
+                );
+                line = apply_station_line_style(line, *station_idx);
+                plot_ui.line(line);
             }
         });
 
@@ -2375,51 +2412,45 @@ impl UptimePlotApp {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("📡 Station Settings");
                     ui.add_space(5.0);
-                    egui::Grid::new("station_grid").num_columns(2).spacing([40.0, 4.0]).striped(true).show(ui, |ui| {
-                        ui.label("Station:");
-                        egui::ComboBox::new("station_combo", "")
-                            .selected_text(if self.stations.is_empty() { "No stations loaded" } else { &self.stations[self.selected_station].name })
-                            .show_ui(ui, |ui| {
-                                if self.stations.is_empty() {
-                                    ui.label("Load stations from station.txt");
-                                } else {
-                                    for (i, station) in self.stations.iter().enumerate() {
-                                        ui.selectable_value(&mut self.selected_station, i, &station.name);
-                                    }
-                                }
-                            });
-                        ui.end_row();
-
+                    ui.label("Stations:");
+                    egui::ScrollArea::vertical().id_salt("station_list_scroll").max_height(150.0).show(ui, |ui| {
+                        if self.stations.is_empty() {
+                            ui.label("Load stations from station.txt");
+                        } else {
+                            for station in &mut self.stations {
+                                ui.checkbox(&mut station.selected, &station.name);
+                            }
+                        }
+                    });
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
                         ui.label("Station File:");
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.station_file_path);
-                            if ui.button("Load").clicked() {
-                                match pick_file_dialog("Select station.txt") {
-                                    Ok(Some(path)) => {
-                                        self.station_file_path = path.to_string_lossy().to_string();
-                                        match self.load_stations() {
-                                            Ok(_) => self.error_msg = None,
-                                            Err(e) => self.error_msg = Some(e),
-                                        }
+                        ui.text_edit_singleline(&mut self.station_file_path);
+                        if ui.button("Load").clicked() {
+                            match pick_file_dialog("Select station.txt") {
+                                Ok(Some(path)) => {
+                                    self.station_file_path = path.to_string_lossy().to_string();
+                                    match self.load_stations() {
+                                        Ok(_) => self.error_msg = None,
+                                        Err(e) => self.error_msg = Some(e),
                                     }
-                                    Ok(None) => {}
-                                    Err(e) => self.error_msg = Some(e),
                                 }
+                                Ok(None) => {}
+                                Err(e) => self.error_msg = Some(e),
                             }
-                            if ui.button("Reload").clicked() {
-                                match self.load_stations() {
-                                    Ok(_) => self.error_msg = None,
-                                    Err(e) => self.error_msg = Some(e),
-                                }
+                        }
+                        if ui.button("Reload").clicked() {
+                            match self.load_stations() {
+                                Ok(_) => self.error_msg = None,
+                                Err(e) => self.error_msg = Some(e),
                             }
-                            if ui.button("Open").clicked() {
-                                match utils::open_file_in_external_editor(&self.station_file_path) {
-                                    Ok(_) => self.error_msg = None,
-                                    Err(e) => self.error_msg = Some(e),
-                                }
+                        }
+                        if ui.button("Open").clicked() {
+                            match utils::open_file_in_external_editor(&self.station_file_path) {
+                                Ok(_) => self.error_msg = None,
+                                Err(e) => self.error_msg = Some(e),
                             }
-                        });
-                        ui.end_row();
+                        }
                     });
                 });
                 ui.add_space(10.0);
@@ -2654,12 +2685,16 @@ impl UptimePlotApp {
                 );
             }
 
-            for (name, polar_points, hour_marker_points, hour_labels) in &self.polar_plot_data {
+            for (source_name, station_name, polar_points, hour_marker_points, hour_labels, station_idx) in
+                &self.polar_plot_data
+            {
                 if !polar_points.is_empty() {
-                    plot_ui.points(Points::new(
-                        name.clone(),
-                        PlotPoints::from(polar_points.clone()),
-                    ));
+                    let mut line = Line::new(
+                        format!("{}:{}", source_name, station_name),
+                        PlotPoints::from_iter(polar_points.iter().copied()),
+                    );
+                    line = apply_station_line_style(line, *station_idx);
+                    plot_ui.line(line);
                 }
                 if !hour_marker_points.is_empty() {
                     plot_ui.points(
@@ -2688,7 +2723,6 @@ impl UptimePlotApp {
             return;
         }
 
-        let lst_plot_data = &self.lst_plot_data;
         let az_pointer_formatter =
             |x: f64, y: f64| format!("LST: {}\nAz: {:.1}°", format_hour_hms(x), y);
         let el_pointer_formatter =
@@ -2792,8 +2826,13 @@ impl UptimePlotApp {
                 [0.0, -5.0],
                 [24.7, 365.0],
             ));
-            for (name, az_points, _) in lst_plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(az_points.clone())));
+            for (source_name, station_name, az_points, _, station_idx) in &self.lst_plot_data {
+                let mut line = Line::new(
+                    format!("{}:{}", source_name, station_name),
+                    PlotPoints::from_iter(az_points.iter().copied()),
+                );
+                line = apply_station_line_style(line, *station_idx);
+                plot_ui.line(line);
             }
         });
 
@@ -2804,8 +2843,13 @@ impl UptimePlotApp {
                 [0.0, 0.0],
                 [24.7, 91.0],
             ));
-            for (name, _, el_points) in lst_plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(el_points.clone())));
+            for (source_name, station_name, _, el_points, station_idx) in &self.lst_plot_data {
+                let mut line = Line::new(
+                    format!("{}:{}", source_name, station_name),
+                    PlotPoints::from_iter(el_points.iter().copied()),
+                );
+                line = apply_station_line_style(line, *station_idx);
+                plot_ui.line(line);
             }
         });
 
