@@ -43,6 +43,20 @@ Linux/macOS native build:
 cargo build --release
 ```
 
+The default Linux build supports both X11 and Wayland. To compile only the
+window-system backend used by the target environment:
+
+```bash
+# X11 only
+cargo build --release --no-default-features --features x11
+
+# Wayland only
+cargo build --release --no-default-features --features wayland
+```
+
+Windows and macOS do not compile the Linux-only backend dependencies. The app
+uses eframe's OpenGL (`glow`) renderer; the WGPU/Vulkan renderer is disabled.
+
 Run:
 
 ```bash
