@@ -33,7 +33,9 @@ The files are:
 - `antenna.sch`
 - `station.txt`
 
-These files are embedded in the executable and are copied to the user data directory if they do not already exist.
+If `source.txt` or `station.txt` is missing, the program creates an empty file
+containing only a `#` format header. The embedded default `antenna.sch` is copied
+when it is missing.
 
 ## Build
 
@@ -61,6 +63,34 @@ Run:
 
 ```bash
 ./target/release/uptimeplot
+```
+
+## DRG checks from the terminal
+
+Load a DRG directly into the GUI SKD Table:
+
+```bash
+./target/release/uptimeplot --drg schedule.DRG
+```
+
+Run the same limits and slew checks without opening the GUI:
+
+```bash
+./target/release/uptimeplot --drg schedule.DRG --terminal
+```
+
+The schedule is written to standard output as TSV, one row per scan and
+antenna. `slew_required_s` and `slew_available_s` show whether the antenna can
+reach the next source in time. The `limits_ok`, `slew_ok`, and `scan_ok` columns use
+`1` for success and `0` for failure. The command exits with status `1` if any
+scan fails, or `2` for an input error.
+
+A bash loop can save one TSV report per DRG:
+
+```bash
+for drg in *.DRG; do
+    ./target/release/uptimeplot --drg "$drg" --terminal > "${drg%.DRG}.tsv"
+done
 ```
 
 Windows cross-build from Linux, using the GNU target:

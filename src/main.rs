@@ -5,7 +5,7 @@ use eframe::egui;
 use egui_plot::{Corner, GridMark, Legend, Line, Plot, PlotPoints, Points};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 mod utils;
@@ -58,6 +58,8 @@ struct OutputCaptureState {
 struct CliArgs {
     station_path: Option<PathBuf>,
     source_path: Option<PathBuf>,
+    drg_path: Option<PathBuf>,
+    terminal: bool,
 }
 
 impl CliArgs {
@@ -70,7 +72,7 @@ impl CliArgs {
             match option.as_ref() {
                 "-h" | "--help" => {
                     println!(
-                        "Uptime Plotter {}\n\nUsage: uptimeplot [OPTIONS]\n\nOptions:\n  --station-path <PATH>  Path to station.txt\n  --source-path <PATH>   Path to source.txt\n  -h, --help             Print help\n  -V, --version          Print version",
+                        "Uptime Plotter {}\n\nUsage: uptimeplot [OPTIONS]\n\nOptions:\n  --drg <FILE>           Load a DRG schedule\n  --terminal             Print the DRG schedule check as TSV without a GUI\n  --station-path <PATH>  Path to station.txt\n  --source-path <PATH>   Path to source.txt\n  -h, --help             Print help\n  -V, --version          Print version",
                         env!("CARGO_PKG_VERSION")
                     );
                     std::process::exit(0);
@@ -85,11 +87,19 @@ impl CliArgs {
                 "--source-path" => {
                     parsed.source_path = Some(Self::next_path(&mut args, "--source-path"));
                 }
+                "--drg" => {
+                    parsed.drg_path = Some(Self::next_path(&mut args, "--drg"));
+                }
+                "--terminal" => {
+                    parsed.terminal = true;
+                }
                 _ => {
                     if let Some(path) = option.strip_prefix("--station-path=") {
                         parsed.station_path = Some(PathBuf::from(path));
                     } else if let Some(path) = option.strip_prefix("--source-path=") {
                         parsed.source_path = Some(PathBuf::from(path));
+                    } else if let Some(path) = option.strip_prefix("--drg=") {
+                        parsed.drg_path = Some(PathBuf::from(path));
                     } else {
                         eprintln!("Unknown option: {option}\nUse --help for usage.");
                         std::process::exit(2);
@@ -115,6 +125,20 @@ impl CliArgs {
 fn main() -> Result<(), eframe::Error> {
     let cli_args = CliArgs::parse();
 
+    if cli_args.terminal {
+        let Some(drg_path) = cli_args.drg_path.as_deref() else {
+            eprintln!("uptimeplot: --terminal requires --drg <FILE>");
+            std::process::exit(2);
+        };
+        match print_terminal_drg_report(&cli_args, drg_path) {
+            Ok(true) => return Ok(()),
+            Ok(false) => std::process::exit(1),
+            Err(error) => {
+                eprintln!("uptimeplot: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
         renderer: eframe::Renderer::Glow,
@@ -138,6 +162,157 @@ fn main() -> Result<(), eframe::Error> {
             Ok(app)
         }),
     )
+}
+
+fn terminal_float(value: Option<f64>) -> String {
+    value
+        .filter(|number| number.is_finite())
+        .map(|number| format!("{number:.3}"))
+        .unwrap_or_else(|| "NaN".to_string())
+}
+
+fn print_terminal_drg_report(cli_args: &CliArgs, drg_path: &Path) -> Result<bool, String> {
+    let mut app = UptimePlotApp::new(CliArgs {
+        station_path: cli_args.station_path.clone(),
+        source_path: cli_args.source_path.clone(),
+        drg_path: None,
+        terminal: false,
+    });
+    if app.antennas.is_empty() {
+        return Err(format!("No antennas loaded from {}", app.antenna_file_path));
+    }
+
+    app.input_drg_file_path = drg_path.to_string_lossy().to_string();
+    app.load_drg_file()?;
+    if app.skd_rows.is_empty() {
+        return Err("The DRG contains no SKED rows.".to_string());
+    }
+
+    let mut antenna_indices = Vec::new();
+    for index in [app.selected_antenna, app.selected_antenna_2] {
+        if index < app.antennas.len() && !antenna_indices.contains(&index) {
+            antenna_indices.push(index);
+        }
+    }
+    if antenna_indices.is_empty() {
+        return Err("No antenna is available for schedule checks.".to_string());
+    }
+
+    let source_map: HashMap<&str, &Source> = app
+        .sources
+        .iter()
+        .map(|(source, _)| (source.name.as_str(), source))
+        .collect();
+    let mut previous_ends: Vec<Option<ScanEnd>> = vec![None; antenna_indices.len()];
+    let mut failures = 0_usize;
+
+    println!(
+        "scan\tsource\tstart_utc\tduration_s\tantenna\tstart_az_deg\tstart_el_deg\tend_az_deg\tend_el_deg\taz_rate_deg_min\tel_rate_deg_min\taz_min_deg\taz_max_deg\tel_min_deg\tel_max_deg\tgeometry_ok\tlimits_ok\thas_previous\tslew_required_s\tslew_available_s\tslew_ok\tscan_ok"
+    );
+
+    for (scan_index, row) in app.skd_rows.iter().enumerate() {
+        let start_dt = schedule_datetime(row.start_date, &row.start_time)?;
+        let start_text = start_dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let source = source_map.get(row.source_name.as_str()).copied();
+
+        for (output_index, antenna_index) in antenna_indices.iter().copied().enumerate() {
+            let antenna = &app.antennas[antenna_index];
+            let previous_end = previous_ends[output_index];
+            let mut start_az = None;
+            let mut start_el = None;
+            let mut end_az = None;
+            let mut end_el = None;
+            let mut geometry_ok = false;
+            let mut limits_ok = false;
+            let mut has_previous = false;
+            let mut slew_required = None;
+            let mut slew_available = None;
+            let mut slew_ok = false;
+
+            if let Some(source) = source {
+                if let (
+                    Some((_, current_start_az, current_start_el)),
+                    Some((end_dt, current_end_az, current_end_el)),
+                ) = (
+                    scan_az_el_for(row, source, antenna.pos, false),
+                    scan_az_el_for(row, source, antenna.pos, true),
+                ) {
+                    geometry_ok = true;
+                    start_az = Some(current_start_az);
+                    start_el = Some(current_start_el);
+                    end_az = Some(current_end_az);
+                    end_el = Some(current_end_el);
+                    limits_ok = antenna.allows(current_start_az, current_start_el)
+                        && antenna.allows(current_end_az, current_end_el);
+
+                    if let Some((previous_end_dt, previous_end_az, previous_end_el)) = previous_end
+                    {
+                        has_previous = true;
+                        let available = (start_dt - previous_end_dt).num_seconds() as f64;
+                        let required = antenna.slew_seconds(
+                            previous_end_az,
+                            previous_end_el,
+                            current_start_az,
+                            current_start_el,
+                        );
+                        slew_available = Some(available);
+                        slew_required = required;
+                        slew_ok = available >= 0.0
+                            && required
+                                .map(|required| available + 1.0e-6 >= required)
+                                .unwrap_or(false);
+                    } else {
+                        slew_ok = true;
+                    }
+
+                    previous_ends[output_index] = Some((end_dt, current_end_az, current_end_el));
+                } else {
+                    previous_ends[output_index] = None;
+                }
+            } else {
+                previous_ends[output_index] = None;
+            }
+
+            let scan_ok = geometry_ok && limits_ok && slew_ok;
+            if !scan_ok {
+                failures += 1;
+            }
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                scan_index + 1,
+                row.source_name,
+                start_text,
+                row.duration_sec,
+                antenna.name,
+                terminal_float(start_az),
+                terminal_float(start_el),
+                terminal_float(end_az),
+                terminal_float(end_el),
+                antenna.az_rate_deg_per_min,
+                antenna.el_rate_deg_per_min,
+                antenna.az_min_deg,
+                antenna.az_max_deg,
+                antenna.el_min_deg,
+                antenna.el_max_deg,
+                geometry_ok as u8,
+                limits_ok as u8,
+                has_previous as u8,
+                terminal_float(slew_required),
+                terminal_float(slew_available),
+                slew_ok as u8,
+                scan_ok as u8,
+            );
+        }
+    }
+
+    eprintln!(
+        "# drg={} scans={} antennas={} failures={}",
+        output_drg_path(&drg_path.to_string_lossy())?.display(),
+        app.skd_rows.len(),
+        antenna_indices.len(),
+        failures
+    );
+    Ok(failures == 0)
 }
 
 struct Station {
@@ -497,6 +672,9 @@ impl UptimePlotApp {
 
         // Determine source_file_path
         let source_file_path = cli_args.source_path.unwrap_or(default_source_path);
+        let input_drg_path = cli_args.drg_path;
+        let _ = ensure_text_file_with_header(&station_file_path, DEFAULT_STATION_TXT);
+        let _ = ensure_text_file_with_header(&source_file_path, DEFAULT_SOURCE_TXT);
 
         let stations: Vec<Station> = {
             let mut stations_vec = Vec::new();
@@ -504,7 +682,11 @@ impl UptimePlotApp {
                 let reader = BufReader::new(file);
                 for line in reader.lines() {
                     if let Ok(line) = line {
-                        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') || line.starts_with('*') {
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() == 4 {
                             if let (Ok(pos_x), Ok(pos_y), Ok(pos_z)) = (
                                 parts[1].parse::<f64>(),
@@ -591,7 +773,11 @@ impl UptimePlotApp {
             show_calendar: false,
             show_new_skd_calendar: false,
             search_query: String::new(),
-            selected_tab: AppTab::UptimePlotters,
+            selected_tab: if input_drg_path.is_some() {
+                AppTab::SkdTable
+            } else {
+                AppTab::UptimePlotters
+            },
             uptime_plot_rect: None,
             polar_plot_rect: None,
             lst_plot_rect: None,
@@ -599,6 +785,13 @@ impl UptimePlotApp {
         };
         let _ = app.load_sources();
         let _ = app.load_antennas();
+        if let Some(path) = input_drg_path {
+            app.input_drg_file_path = path.to_string_lossy().to_string();
+            if let Err(error) = app.load_drg_file() {
+                app.error_msg = Some(error);
+            }
+        }
+
         app
     }
 }
@@ -649,13 +842,14 @@ impl eframe::App for UptimePlotApp {
 
 impl UptimePlotApp {
     fn load_sources(&mut self) -> Result<(), String> {
+        ensure_text_file_with_header(Path::new(&self.source_file_path), DEFAULT_SOURCE_TXT)?;
         let source_content = fs::read_to_string(&self.source_file_path)
             .map_err(|e| format!("Failed to read source file: {}", e))?;
 
         let mut sources = Vec::new();
         for line in source_content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('*') {
+            if line.is_empty() || line.starts_with('#') || line.starts_with('*') {
                 continue;
             }
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -781,13 +975,14 @@ impl UptimePlotApp {
             })
             .collect();
 
+        ensure_text_file_with_header(Path::new(&self.station_file_path), DEFAULT_STATION_TXT)?;
         let station_content = fs::read_to_string(&self.station_file_path)
             .map_err(|e| format!("Failed to read station file: {}", e))?;
 
         let mut stations_vec = Vec::new();
         for line in station_content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('*') {
+            if line.is_empty() || line.starts_with('#') || line.starts_with('*') {
                 continue;
             }
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -3052,9 +3247,9 @@ impl UptimePlotApp {
     }
 }
 
-const DEFAULT_SOURCE_TXT: &str = include_str!("../source.txt");
+const DEFAULT_SOURCE_TXT: &str = "# NAME RA_H RA_M RA_S DEC_D DEC_M DEC_S [EPOCH]\n";
 const DEFAULT_ANTENNA_SCH: &str = include_str!("../antenna.sch");
-const DEFAULT_STATION_TXT: &str = include_str!("../station.txt");
+const DEFAULT_STATION_TXT: &str = "# NAME X_POS Y_POS Z_POS (ECEF meters)\n";
 
 fn uptimeplot_data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
@@ -3081,6 +3276,34 @@ fn ensure_user_data_file(dir: &Path, filename: &str, default_content: &str) -> O
         return None;
     }
     Some(path)
+}
+
+fn ensure_text_file_with_header(path: &Path, header: &str) -> Result<(), String> {
+    if path.is_file() {
+        return Ok(());
+    }
+    if path.exists() {
+        return Err(format!("Path is not a regular file: {}", path.display()));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+    }
+
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file
+            .write_all(header.as_bytes())
+            .map_err(|e| format!("Failed to initialize {}: {}", path.display(), e)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("Failed to create {}: {}", path.display(), e)),
+    }
 }
 
 fn pick_file_dialog(title: &str) -> Result<Option<PathBuf>, String> {
@@ -3702,6 +3925,26 @@ fn calendar_ui(ui: &mut egui::Ui, date: &mut NaiveDate) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_text_file_is_initialized_without_overwriting_existing_content() {
+        let path = std::env::temp_dir().join(format!(
+            "uptimeplot-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        ensure_text_file_with_header(&path, DEFAULT_SOURCE_TXT).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_SOURCE_TXT);
+
+        std::fs::write(&path, "existing\n").unwrap();
+        ensure_text_file_with_header(&path, DEFAULT_STATION_TXT).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing\n");
+
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_slew_seconds() {
