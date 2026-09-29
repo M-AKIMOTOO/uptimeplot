@@ -2,8 +2,8 @@
 
 use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use eframe::egui;
-use egui_plot::{Corner, GridMark, Legend, Line, Plot, PlotPoints, Points};
-use std::collections::HashMap;
+use egui_plot::{Bar, BarChart, Corner, GridMark, Legend, Line, Plot, PlotPoints, Points};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,9 @@ mod utils;
 const PLOT_Y_AXIS_MIN_WIDTH: f32 = 96.0;
 const PLOT_MIN_ELEVATION_DEG: f64 = 1.0;
 const DEFAULT_FIVE_POINT_OFFSET_ARCMIN: f64 = 2.0;
+const ANTENNA_FIXED_AZ_DEG: f64 = 244.0;
+const ANTENNA_FIXED_EL_DEG: f64 = 20.0;
+const SKD_HISTORY_LIMIT: usize = 100;
 
 const SKD_COL_NUM: f32 = 24.0;
 const SKD_COL_SOURCE: f32 = 116.0;
@@ -349,7 +352,7 @@ struct Source {
     epoch: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct SkdRow {
     source_name: String,
     start_date: NaiveDate,
@@ -504,6 +507,17 @@ fn show_motion_status_cell(ui: &mut egui::Ui, text: &str) -> egui::Response {
     .response
 }
 
+fn skd_status_has_problem(status: &SkdRowStatus) -> bool {
+    [
+        &status.start_geometry,
+        &status.end_geometry,
+        &status.motion_1,
+        &status.motion_2,
+    ]
+    .iter()
+    .any(|value| value.contains("NO") || value.contains("Load ant"))
+}
+
 fn show_status_token(ui: &mut egui::Ui, token: &str, width: f32) {
     let color = match token {
         "OK" => egui::Color32::GREEN,
@@ -614,6 +628,25 @@ struct UptimePlotApp {
     skd_rows: Vec<SkdRow>,
     skd_status_cache: Vec<SkdRowStatus>,
     skd_status_dirty: bool,
+    selected_skd_row: Option<usize>,
+    selected_skd_rows: BTreeSet<usize>,
+    skd_undo_stack: Vec<Vec<SkdRow>>,
+    skd_redo_stack: Vec<Vec<SkdRow>>,
+    skd_slew_gap_sec: u32,
+    skd_auto_slew_margin_sec: u32,
+    skd_show_problems_only: bool,
+    skd_scroll_to_row: Option<usize>,
+    skd_show_timeline: bool,
+    skd_block_repeat_count: u32,
+    skd_block_gap_sec: u32,
+    skd_block_clipboard: Vec<SkdRow>,
+    skd_bulk_source_index: usize,
+    skd_bulk_duration_sec: u32,
+    skd_bulk_shift_sec: i32,
+    skd_bulk_az_offset_deg: f64,
+    skd_bulk_el_offset_deg: f64,
+    skd_bulk_ra_offset_deg: f64,
+    skd_bulk_dec_offset_deg: f64,
     new_skd_source_index: usize,
     new_skd_start_date: NaiveDate,
     new_skd_start_time: String,
@@ -746,6 +779,25 @@ impl UptimePlotApp {
             skd_rows: Vec::new(),
             skd_status_cache: Vec::new(),
             skd_status_dirty: true,
+            selected_skd_row: None,
+            selected_skd_rows: BTreeSet::new(),
+            skd_undo_stack: Vec::new(),
+            skd_redo_stack: Vec::new(),
+            skd_slew_gap_sec: 60,
+            skd_auto_slew_margin_sec: 0,
+            skd_show_problems_only: false,
+            skd_scroll_to_row: None,
+            skd_show_timeline: false,
+            skd_block_repeat_count: 1,
+            skd_block_gap_sec: 60,
+            skd_block_clipboard: Vec::new(),
+            skd_bulk_source_index: 0,
+            skd_bulk_duration_sec: 240,
+            skd_bulk_shift_sec: 0,
+            skd_bulk_az_offset_deg: 0.0,
+            skd_bulk_el_offset_deg: 0.0,
+            skd_bulk_ra_offset_deg: 0.0,
+            skd_bulk_dec_offset_deg: 0.0,
             new_skd_source_index: 0,
             new_skd_start_date: Utc::now().date_naive(),
             new_skd_start_time: "00:00:00".to_string(),
@@ -757,7 +809,7 @@ impl UptimePlotApp {
             interleave_cal_duration_sec: 240,
             interleave_slew_sec: 60,
             interleave_cycles: 10,
-            interleave_clear_existing: true,
+            interleave_clear_existing: false,
             schedule_time_shift_sec: 0,
             five_point_cal_index: 0,
             five_point_start_time: "00:00:00".to_string(),
@@ -1548,6 +1600,18 @@ impl UptimePlotApp {
         }
         self.skd_rows = rows;
         self.sort_skd_rows_by_start_time();
+        // Loading a DRG always returns generators to the non-destructive mode.
+        // A replacement must be explicitly requested after the file is loaded.
+        self.interleave_clear_existing = false;
+        self.five_point_clear_existing = false;
+        self.skd_undo_stack.clear();
+        self.skd_redo_stack.clear();
+        self.skd_block_clipboard.clear();
+        if self.skd_rows.is_empty() {
+            self.clear_skd_selection();
+        } else {
+            self.select_only_skd_row(0);
+        }
         if let Some(first_row) = self.skd_rows.first() {
             self.selected_date = first_row.start_date;
         }
@@ -1677,6 +1741,7 @@ impl UptimePlotApp {
             offset_sec += self.five_point_obstime_sec as i64 + self.five_point_slew_sec as i64;
         }
 
+        self.record_skd_undo();
         if self.five_point_clear_existing {
             self.skd_rows = generated;
         } else {
@@ -1740,6 +1805,7 @@ impl UptimePlotApp {
             }
         }
 
+        self.record_skd_undo();
         if self.interleave_clear_existing {
             self.skd_rows = generated;
         } else {
@@ -1753,6 +1819,7 @@ impl UptimePlotApp {
         if days == 0 {
             return;
         }
+        self.record_skd_undo();
         for row in &mut self.skd_rows {
             row.start_date = row.start_date + Duration::days(days);
         }
@@ -1764,7 +1831,8 @@ impl UptimePlotApp {
             return Err("No SKED rows to shift.".to_string());
         }
         let shift_sec = self.schedule_time_shift_sec as i64;
-        for row in &mut self.skd_rows {
+        let mut updated = self.skd_rows.clone();
+        for row in &mut updated {
             let shifted =
                 schedule_datetime(row.start_date, &row.start_time)? + Duration::seconds(shift_sec);
             row.start_date = shifted.date();
@@ -1775,6 +1843,8 @@ impl UptimePlotApp {
                 shifted.time().second()
             );
         }
+        self.record_skd_undo();
+        self.skd_rows = updated;
         self.sort_skd_rows_by_start_time();
         Ok(())
     }
@@ -1785,6 +1855,7 @@ impl UptimePlotApp {
             let b_dt = schedule_datetime(b.start_date, &b.start_time).ok();
             a_dt.cmp(&b_dt)
         });
+        self.clear_skd_selection();
         self.mark_skd_status_dirty();
     }
 
@@ -1876,7 +1947,747 @@ impl UptimePlotApp {
             .find(|source| source.name == name)
     }
 
+    fn record_skd_undo(&mut self) {
+        let snapshot = self.skd_rows.clone();
+        if self.skd_undo_stack.last() != Some(&snapshot) {
+            self.skd_undo_stack.push(snapshot);
+            if self.skd_undo_stack.len() > SKD_HISTORY_LIMIT {
+                self.skd_undo_stack.remove(0);
+            }
+        }
+        self.skd_redo_stack.clear();
+    }
+
+    fn record_skd_undo_snapshot(&mut self, snapshot: Vec<SkdRow>) {
+        if snapshot == self.skd_rows {
+            return;
+        }
+        if self.skd_undo_stack.last() != Some(&snapshot) {
+            self.skd_undo_stack.push(snapshot);
+            if self.skd_undo_stack.len() > SKD_HISTORY_LIMIT {
+                self.skd_undo_stack.remove(0);
+            }
+        }
+        self.skd_redo_stack.clear();
+    }
+
+    fn clear_skd_selection(&mut self) {
+        self.selected_skd_row = None;
+        self.selected_skd_rows.clear();
+    }
+
+    fn select_only_skd_row(&mut self, index: usize) {
+        self.selected_skd_rows.clear();
+        if index < self.skd_rows.len() {
+            self.selected_skd_rows.insert(index);
+            self.selected_skd_row = Some(index);
+        } else {
+            self.selected_skd_row = None;
+        }
+    }
+
+    fn select_skd_row(&mut self, index: usize, modifiers: egui::Modifiers) {
+        if index >= self.skd_rows.len() {
+            return;
+        }
+        if modifiers.shift {
+            let anchor = self.selected_skd_row.unwrap_or(index);
+            if !(modifiers.ctrl || modifiers.command) {
+                self.selected_skd_rows.clear();
+            }
+            for row_index in anchor.min(index)..=anchor.max(index) {
+                self.selected_skd_rows.insert(row_index);
+            }
+        } else if modifiers.ctrl || modifiers.command {
+            if !self.selected_skd_rows.remove(&index) {
+                self.selected_skd_rows.insert(index);
+            }
+        } else {
+            self.selected_skd_rows.clear();
+            self.selected_skd_rows.insert(index);
+        }
+        self.selected_skd_row = self
+            .selected_skd_rows
+            .contains(&index)
+            .then_some(index)
+            .or_else(|| self.selected_skd_rows.iter().next_back().copied());
+    }
+
+    fn selected_skd_indices(&self) -> Vec<usize> {
+        self.selected_skd_rows
+            .iter()
+            .copied()
+            .filter(|index| *index < self.skd_rows.len())
+            .collect()
+    }
+
+    fn undo_skd_edit(&mut self) -> Result<(), String> {
+        let previous = self
+            .skd_undo_stack
+            .pop()
+            .ok_or_else(|| "Nothing to undo.".to_string())?;
+        self.skd_redo_stack.push(self.skd_rows.clone());
+        self.skd_rows = previous;
+        self.clear_skd_selection();
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn redo_skd_edit(&mut self) -> Result<(), String> {
+        let next = self
+            .skd_redo_stack
+            .pop()
+            .ok_or_else(|| "Nothing to redo.".to_string())?;
+        self.skd_undo_stack.push(self.skd_rows.clone());
+        self.skd_rows = next;
+        self.clear_skd_selection();
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn new_skd_row_from_inputs(&self) -> Result<SkdRow, String> {
+        let source = self
+            .sources
+            .get(self.new_skd_source_index)
+            .ok_or_else(|| "Load Source Settings before adding a row.".to_string())?;
+        let start_time = normalize_time_string(&self.new_skd_start_time)
+            .ok_or_else(|| "Start time must be HH:MM:SS or HHMMSS.".to_string())?;
+
+        Ok(SkdRow {
+            source_name: source.0.name.clone(),
+            start_date: self.new_skd_start_date,
+            start_time,
+            duration_sec: self.new_skd_duration_sec,
+            az_offset_deg: 0.0,
+            el_offset_deg: 0.0,
+            ra_offset_deg: 0.0,
+            dec_offset_deg: 0.0,
+            include_station_offsets: false,
+        })
+    }
+
+    fn insert_new_skd_row(&mut self, index: usize) -> Result<(), String> {
+        let row = self.new_skd_row_from_inputs()?;
+        let index = index.min(self.skd_rows.len());
+        self.record_skd_undo();
+        self.skd_rows.insert(index, row);
+        self.select_only_skd_row(index);
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn duplicate_selected_skd_row(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        let insert_at = selected
+            .last()
+            .copied()
+            .map(|index| index + 1)
+            .ok_or_else(|| "Select one or more schedule rows first.".to_string())?;
+        let rows: Vec<SkdRow> = selected
+            .iter()
+            .map(|index| self.skd_rows[*index].clone())
+            .collect();
+        self.record_skd_undo();
+        let count = rows.len();
+        self.skd_rows.splice(insert_at..insert_at, rows);
+        self.selected_skd_rows = (insert_at..insert_at + count).collect();
+        self.selected_skd_row = Some(insert_at + count - 1);
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn move_selected_skd_row(&mut self, direction: isize) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more schedule rows first.".to_string());
+        }
+        if (direction < 0 && selected[0] == 0)
+            || (direction > 0 && *selected.last().unwrap() + 1 >= self.skd_rows.len())
+        {
+            return Err("The selected block cannot be moved farther.".to_string());
+        }
+
+        self.record_skd_undo();
+        if direction < 0 {
+            for index in &selected {
+                self.skd_rows.swap(*index, *index - 1);
+            }
+        } else {
+            for index in selected.iter().rev() {
+                self.skd_rows.swap(*index, *index + 1);
+            }
+        }
+        self.selected_skd_rows = selected
+            .iter()
+            .map(|index| (*index as isize + direction) as usize)
+            .collect();
+        self.selected_skd_row = self
+            .selected_skd_row
+            .map(|index| (index as isize + direction) as usize);
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn set_selected_start_after_previous(&mut self) -> Result<(), String> {
+        let index = self
+            .selected_skd_row
+            .filter(|index| *index < self.skd_rows.len())
+            .ok_or_else(|| "Select a schedule row first.".to_string())?;
+        if index == 0 {
+            return Err("The first row has no previous scan.".to_string());
+        }
+
+        let previous = &self.skd_rows[index - 1];
+        let offset_sec = previous.duration_sec as i64 + self.skd_slew_gap_sec as i64;
+        let (start_date, start_time) =
+            offset_schedule_time(previous.start_date, &previous.start_time, offset_sec)?;
+        self.record_skd_undo();
+        self.skd_rows[index].start_date = start_date;
+        self.skd_rows[index].start_time = start_time;
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn delete_skd_row(&mut self, index: usize) {
+        if index >= self.skd_rows.len() {
+            return;
+        }
+        self.record_skd_undo();
+        self.skd_rows.remove(index);
+        if self.skd_rows.is_empty() {
+            self.clear_skd_selection();
+        } else {
+            self.select_only_skd_row(index.min(self.skd_rows.len() - 1));
+        }
+        self.mark_skd_status_dirty();
+    }
+
+    fn delete_selected_skd_rows(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more schedule rows first.".to_string());
+        }
+        self.record_skd_undo();
+        let selected: BTreeSet<usize> = selected.into_iter().collect();
+        self.skd_rows = self
+            .skd_rows
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, row)| (!selected.contains(&index)).then_some(row))
+            .collect();
+        self.clear_skd_selection();
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn repeat_selected_skd_block(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more rows for the observation block.".to_string());
+        }
+        if self.skd_block_repeat_count == 0 {
+            return Err("Repeat count must be at least 1.".to_string());
+        }
+
+        let block: Vec<SkdRow> = selected
+            .iter()
+            .map(|index| self.skd_rows[*index].clone())
+            .collect();
+        let first_start = schedule_datetime(block[0].start_date, &block[0].start_time)?;
+        let mut relative_starts = Vec::with_capacity(block.len());
+        let mut block_span_sec = 0_i64;
+        for row in &block {
+            let row_start = schedule_datetime(row.start_date, &row.start_time)?;
+            let relative_sec = (row_start - first_start).num_seconds();
+            if relative_sec < 0 {
+                return Err("Block rows must be in chronological order.".to_string());
+            }
+            relative_starts.push(relative_sec);
+            block_span_sec = block_span_sec.max(relative_sec + row.duration_sec as i64);
+        }
+
+        let first_copy_start =
+            first_start + Duration::seconds(block_span_sec + self.skd_block_gap_sec as i64);
+        let insert_at = selected.last().copied().unwrap() + 1;
+        let mut repeated = Vec::new();
+        for repeat_index in 0..self.skd_block_repeat_count {
+            let repeat_start = first_copy_start
+                + Duration::seconds(
+                    repeat_index as i64 * (block_span_sec + self.skd_block_gap_sec as i64),
+                );
+            for (row, relative_sec) in block.iter().zip(&relative_starts) {
+                let mut copy = row.clone();
+                set_skd_row_datetime(&mut copy, repeat_start + Duration::seconds(*relative_sec));
+                repeated.push(copy);
+            }
+        }
+
+        self.record_skd_undo();
+        let repeated_count = repeated.len();
+        self.skd_rows.splice(insert_at..insert_at, repeated);
+        self.selected_skd_rows = (insert_at..insert_at + repeated_count).collect();
+        self.selected_skd_row = Some(insert_at + repeated_count - 1);
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn copy_selected_skd_block(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more rows for the observation block.".to_string());
+        }
+        self.skd_block_clipboard = selected
+            .iter()
+            .map(|index| self.skd_rows[*index].clone())
+            .collect();
+        Ok(())
+    }
+
+    fn paste_skd_block(&mut self, insert_at: usize) -> Result<(), String> {
+        if self.skd_block_clipboard.is_empty() {
+            return Err("Copy an observation block first.".to_string());
+        }
+        let first_start = schedule_datetime(
+            self.skd_block_clipboard[0].start_date,
+            &self.skd_block_clipboard[0].start_time,
+        )?;
+        let mut relative_starts = Vec::with_capacity(self.skd_block_clipboard.len());
+        let mut block_span_sec = 0_i64;
+        for row in &self.skd_block_clipboard {
+            let row_start = schedule_datetime(row.start_date, &row.start_time)?;
+            let relative_sec = (row_start - first_start).num_seconds();
+            if relative_sec < 0 {
+                return Err("Block rows must be in chronological order.".to_string());
+            }
+            relative_starts.push(relative_sec);
+            block_span_sec = block_span_sec.max(relative_sec + row.duration_sec as i64);
+        }
+
+        let insert_at = insert_at.min(self.skd_rows.len());
+        let paste_start = if insert_at > 0 {
+            let previous = &self.skd_rows[insert_at - 1];
+            schedule_datetime(previous.start_date, &previous.start_time)?
+                + Duration::seconds(previous.duration_sec as i64 + self.skd_block_gap_sec as i64)
+        } else if let Some(next) = self.skd_rows.first() {
+            schedule_datetime(next.start_date, &next.start_time)?
+                - Duration::seconds(block_span_sec + self.skd_block_gap_sec as i64)
+        } else {
+            first_start
+        };
+        let mut pasted = self.skd_block_clipboard.clone();
+        for (row, relative_sec) in pasted.iter_mut().zip(relative_starts) {
+            set_skd_row_datetime(row, paste_start + Duration::seconds(relative_sec));
+        }
+
+        self.record_skd_undo();
+        let count = pasted.len();
+        self.skd_rows.splice(insert_at..insert_at, pasted);
+        self.selected_skd_rows = (insert_at..insert_at + count).collect();
+        self.selected_skd_row = Some(insert_at + count - 1);
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn apply_bulk_source(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        let source_name = self
+            .sources
+            .get(self.skd_bulk_source_index)
+            .map(|source| source.0.name.clone())
+            .ok_or_else(|| "Load Source Settings first.".to_string())?;
+        if selected.is_empty() {
+            return Err("Select one or more schedule rows first.".to_string());
+        }
+        self.record_skd_undo();
+        for index in selected {
+            self.skd_rows[index].source_name = source_name.clone();
+        }
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn apply_bulk_duration(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more schedule rows first.".to_string());
+        }
+        self.record_skd_undo();
+        for index in selected {
+            self.skd_rows[index].duration_sec = self.skd_bulk_duration_sec;
+        }
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn apply_bulk_offsets(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more schedule rows first.".to_string());
+        }
+        self.record_skd_undo();
+        for index in selected {
+            let row = &mut self.skd_rows[index];
+            row.az_offset_deg = self.skd_bulk_az_offset_deg;
+            row.el_offset_deg = self.skd_bulk_el_offset_deg;
+            row.ra_offset_deg = self.skd_bulk_ra_offset_deg;
+            row.dec_offset_deg = self.skd_bulk_dec_offset_deg;
+        }
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn apply_bulk_time_shift(&mut self) -> Result<(), String> {
+        let selected = self.selected_skd_indices();
+        if selected.is_empty() {
+            return Err("Select one or more schedule rows first.".to_string());
+        }
+        let mut updated = self.skd_rows.clone();
+        for index in selected {
+            let start = schedule_datetime(updated[index].start_date, &updated[index].start_time)?;
+            set_skd_row_datetime(
+                &mut updated[index],
+                start + Duration::seconds(self.skd_bulk_shift_sec as i64),
+            );
+        }
+        self.record_skd_undo();
+        self.skd_rows = updated;
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn auto_schedule_from_selected(&mut self) -> Result<(), String> {
+        if self.skd_rows.len() < 2 {
+            return Err("At least two schedule rows are required.".to_string());
+        }
+        let start_index = self
+            .selected_skd_row
+            .filter(|index| *index < self.skd_rows.len())
+            .unwrap_or(1)
+            .max(1);
+
+        let mut antenna_indices = Vec::new();
+        for index in [self.selected_antenna, self.selected_antenna_2] {
+            if index < self.antennas.len() && !antenna_indices.contains(&index) {
+                antenna_indices.push(index);
+            }
+        }
+        let antennas: Vec<Antenna> = antenna_indices
+            .iter()
+            .filter_map(|index| self.antennas.get(*index).cloned())
+            .collect();
+        if antennas.is_empty() {
+            return Err("Load and select at least one antenna first.".to_string());
+        }
+        let source_map: HashMap<String, Source> = self
+            .sources
+            .iter()
+            .map(|(source, _)| (source.name.clone(), source.clone()))
+            .collect();
+
+        let mut updated = self.skd_rows.clone();
+        for index in start_index..updated.len() {
+            let previous = updated[index - 1].clone();
+            let previous_source = source_map
+                .get(&previous.source_name)
+                .ok_or_else(|| format!("Source '{}' is not loaded.", previous.source_name))?;
+            let current_source_name = updated[index].source_name.clone();
+            let current_source = source_map
+                .get(&current_source_name)
+                .ok_or_else(|| format!("Source '{}' is not loaded.", current_source_name))?;
+            let previous_end = schedule_datetime(previous.start_date, &previous.start_time)?
+                + Duration::seconds(previous.duration_sec as i64);
+            let mut gap_sec = self.skd_auto_slew_margin_sec as i64;
+            let mut converged = false;
+
+            for _ in 0..32 {
+                let candidate_start = previous_end + Duration::seconds(gap_sec);
+                let mut candidate = updated[index].clone();
+                set_skd_row_datetime(&mut candidate, candidate_start);
+                let mut required_sec = 0_i64;
+                for antenna in &antennas {
+                    let (_, previous_az, previous_el) =
+                        scan_az_el_for(&previous, previous_source, antenna.pos, true).ok_or_else(
+                            || format!("Cannot calculate the end position of row {}.", index),
+                        )?;
+                    let (_, current_az, current_el) =
+                        scan_az_el_for(&candidate, current_source, antenna.pos, false).ok_or_else(
+                            || format!("Cannot calculate the start position of row {}.", index + 1),
+                        )?;
+                    let antenna_slew = antenna
+                        .slew_seconds(previous_az, previous_el, current_az, current_el)
+                        .ok_or_else(|| {
+                            format!(
+                                "Row {} is outside the limits of antenna {}.",
+                                index + 1,
+                                antenna.name
+                            )
+                        })?
+                        .ceil() as i64
+                        + self.skd_auto_slew_margin_sec as i64;
+                    required_sec = required_sec.max(antenna_slew);
+                }
+                if gap_sec >= required_sec {
+                    set_skd_row_datetime(&mut updated[index], candidate_start);
+                    converged = true;
+                    break;
+                }
+                gap_sec = required_sec;
+            }
+            if !converged {
+                return Err(format!(
+                    "Slew calculation did not converge for row {}.",
+                    index + 1
+                ));
+            }
+        }
+
+        self.record_skd_undo();
+        self.skd_rows = updated;
+        self.mark_skd_status_dirty();
+        Ok(())
+    }
+
+    fn skd_problem_indices(&self) -> Vec<usize> {
+        self.skd_status_cache
+            .iter()
+            .enumerate()
+            .filter_map(|(index, status)| skd_status_has_problem(status).then_some(index))
+            .collect()
+    }
+
+    fn required_slew_between_rows(&self, previous: &SkdRow, current: &SkdRow) -> Option<f64> {
+        let previous_source = self.find_source(&previous.source_name)?;
+        let current_source = self.find_source(&current.source_name)?;
+        let mut antenna_indices = Vec::new();
+        for index in [self.selected_antenna, self.selected_antenna_2] {
+            if index < self.antennas.len() && !antenna_indices.contains(&index) {
+                antenna_indices.push(index);
+            }
+        }
+        let mut required_sec = 0.0_f64;
+        let mut found_antenna = false;
+        for index in antenna_indices {
+            found_antenna = true;
+            let antenna = &self.antennas[index];
+            let (_, previous_az, previous_el) =
+                scan_az_el_for(previous, previous_source, antenna.pos, true)?;
+            let (_, current_az, current_el) =
+                scan_az_el_for(current, current_source, antenna.pos, false)?;
+            required_sec = required_sec.max(antenna.slew_seconds(
+                previous_az,
+                previous_el,
+                current_az,
+                current_el,
+            )?);
+        }
+        found_antenna.then_some(required_sec)
+    }
+
+    fn show_skd_timeline(&self, ui: &mut egui::Ui) {
+        let dated_rows: Vec<(usize, chrono::NaiveDateTime)> = self
+            .skd_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                schedule_datetime(row.start_date, &row.start_time)
+                    .ok()
+                    .map(|datetime| (index, datetime))
+            })
+            .collect();
+        let Some(base_time) = dated_rows.iter().map(|(_, datetime)| *datetime).min() else {
+            ui.label("No valid scan times for the timeline.");
+            return;
+        };
+
+        let mut scan_bars = Vec::with_capacity(dated_rows.len());
+        let mut slew_bars = Vec::new();
+        let mut idle_bars = Vec::new();
+        let mut max_minute = 1.0_f64;
+        for (index, start) in dated_rows {
+            let row = &self.skd_rows[index];
+            // Negative coordinates keep scan #1 at the top while preserving
+            // the visible row number on an upward-increasing plot axis.
+            let row_center = -(index as f64 + 1.0);
+            let observation_y = row_center + 0.20;
+            let transition_y = row_center - 0.20;
+            let start_minute = (start - base_time).num_seconds() as f64 / 60.0;
+            let duration_minute = row.duration_sec as f64 / 60.0;
+            max_minute = max_minute.max(start_minute + duration_minute);
+            let has_problem = self
+                .skd_status_cache
+                .get(index)
+                .is_some_and(skd_status_has_problem);
+            let fill = if has_problem {
+                egui::Color32::from_rgb(190, 55, 55)
+            } else if self.selected_skd_rows.contains(&index) {
+                egui::Color32::from_rgb(60, 170, 90)
+            } else {
+                egui::Color32::from_rgb(70, 125, 200)
+            };
+            scan_bars.push(
+                Bar::new(observation_y, duration_minute)
+                    .horizontal()
+                    .base_offset(start_minute)
+                    .width(0.32)
+                    .fill(fill)
+                    .name(format!(
+                        "#{} {}  {}  {}s",
+                        index + 1,
+                        row.source_name,
+                        start.format("%Y-%m-%d %H:%M:%S"),
+                        row.duration_sec
+                    )),
+            );
+
+            if index > 0 {
+                let previous = &self.skd_rows[index - 1];
+                if let Ok(previous_start) =
+                    schedule_datetime(previous.start_date, &previous.start_time)
+                {
+                    let previous_end =
+                        previous_start + Duration::seconds(previous.duration_sec as i64);
+                    let available_sec = (start - previous_end).num_seconds() as f64;
+                    let previous_end_minute =
+                        (previous_end - base_time).num_seconds() as f64 / 60.0;
+                    if available_sec < 0.0 {
+                        idle_bars.push(
+                            Bar::new(transition_y, -available_sec / 60.0)
+                                .horizontal()
+                                .base_offset(start_minute)
+                                .width(0.32)
+                                .fill(egui::Color32::RED)
+                                .name(format!(
+                                    "Overlap before row {}: {:.0}s",
+                                    index + 1,
+                                    -available_sec
+                                )),
+                        );
+                    } else if let Some(required_sec) =
+                        self.required_slew_between_rows(previous, row)
+                    {
+                        let slew_color = if required_sec <= available_sec + 1.0e-6 {
+                            egui::Color32::from_rgb(225, 145, 35)
+                        } else {
+                            egui::Color32::RED
+                        };
+                        slew_bars.push(
+                            Bar::new(transition_y, required_sec / 60.0)
+                                .horizontal()
+                                .base_offset(previous_end_minute)
+                                .width(0.32)
+                                .fill(slew_color)
+                                .name(format!(
+                                    "Slew to row {}: required {:.0}s / available {:.0}s",
+                                    index + 1,
+                                    required_sec.ceil(),
+                                    available_sec
+                                )),
+                        );
+                        if available_sec > required_sec {
+                            idle_bars.push(
+                                Bar::new(transition_y, (available_sec - required_sec) / 60.0)
+                                    .horizontal()
+                                    .base_offset(previous_end_minute + required_sec / 60.0)
+                                    .width(0.32)
+                                    .fill(egui::Color32::from_gray(95))
+                                    .name(format!(
+                                        "Idle before row {}: {:.0}s",
+                                        index + 1,
+                                        available_sec - required_sec
+                                    )),
+                            );
+                        }
+                    } else if available_sec > 0.0 {
+                        idle_bars.push(
+                            Bar::new(transition_y, available_sec / 60.0)
+                                .horizontal()
+                                .base_offset(previous_end_minute)
+                                .width(0.32)
+                                .fill(egui::Color32::from_gray(95))
+                                .name(format!(
+                                    "Unclassified gap before row {}: {:.0}s",
+                                    index + 1,
+                                    available_sec
+                                )),
+                        );
+                    }
+                }
+            }
+        }
+
+        let scan_chart = BarChart::new("Observation", scan_bars)
+            .horizontal()
+            .element_formatter(Box::new(|bar, _| bar.name.clone()));
+        let slew_chart = BarChart::new("Slew", slew_bars)
+            .horizontal()
+            .element_formatter(Box::new(|bar, _| bar.name.clone()));
+        let idle_chart = BarChart::new("Idle / overlap", idle_bars)
+            .horizontal()
+            .element_formatter(Box::new(|bar, _| bar.name.clone()));
+        let row_labels: Vec<String> = self
+            .skd_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| format!("#{} {}", index + 1, row.source_name))
+            .collect();
+        Plot::new("skd_timeline_plot")
+            .height((80.0 + self.skd_rows.len() as f32 * 10.0).clamp(170.0, 400.0))
+            .include_x(0.0)
+            .include_x(max_minute)
+            .include_y(-(self.skd_rows.len() as f64 + 1.0))
+            .include_y(0.0)
+            .show_y(true)
+            .y_axis_min_width(150.0)
+            .y_axis_formatter(move |mark, _| {
+                let row_number = (-mark.value).round() as usize;
+                if row_number > 0
+                    && row_number <= row_labels.len()
+                    && ((-mark.value) - row_number as f64).abs() < 0.1
+                {
+                    row_labels[row_number - 1].clone()
+                } else {
+                    String::new()
+                }
+            })
+            .x_axis_label("UTC")
+            .x_axis_formatter(move |mark, _| {
+                let datetime = base_time + Duration::seconds((mark.value * 60.0).round() as i64);
+                datetime.format("%m-%d %H:%M").to_string()
+            })
+            .coordinates_formatter(
+                Corner::LeftTop,
+                egui_plot::CoordinatesFormatter::new(move |point, _| {
+                    let datetime = base_time + Duration::seconds((point.x * 60.0).round() as i64);
+                    datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                }),
+            )
+            .legend(Legend::default())
+            .show(ui, |plot_ui| {
+                plot_ui.bar_chart(idle_chart);
+                plot_ui.bar_chart(slew_chart);
+                plot_ui.bar_chart(scan_chart);
+            });
+    }
+
     fn ui_skd_table_tab(&mut self, ui: &mut egui::Ui) {
+        let undo_shortcut = ui.input(|input| {
+            input.modifiers.command && !input.modifiers.shift && input.key_pressed(egui::Key::Z)
+        });
+        let redo_shortcut = ui.input(|input| {
+            input.modifiers.command
+                && (input.key_pressed(egui::Key::Y)
+                    || (input.modifiers.shift && input.key_pressed(egui::Key::Z)))
+        });
+        if undo_shortcut {
+            if let Err(error) = self.undo_skd_edit() {
+                self.error_msg = Some(error);
+            }
+        } else if redo_shortcut {
+            if let Err(error) = self.redo_skd_edit() {
+                self.error_msg = Some(error);
+            }
+        }
+
         ui.horizontal(|ui| {
             let setup_label = if self.skd_setup_open {
                 "Hide setup panel"
@@ -1889,7 +2700,27 @@ impl UptimePlotApp {
             ui.separator();
             ui.strong(format!("{} scans", self.skd_rows.len()));
             if ui.button("Sort by start time").clicked() {
+                self.record_skd_undo();
                 self.sort_skd_rows_by_start_time();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(!self.skd_undo_stack.is_empty(), egui::Button::new("Undo"))
+                .on_hover_text("Undo schedule edit (Ctrl+Z)")
+                .clicked()
+            {
+                if let Err(error) = self.undo_skd_edit() {
+                    self.error_msg = Some(error);
+                }
+            }
+            if ui
+                .add_enabled(!self.skd_redo_stack.is_empty(), egui::Button::new("Redo"))
+                .on_hover_text("Redo schedule edit (Ctrl+Y)")
+                .clicked()
+            {
+                if let Err(error) = self.redo_skd_edit() {
+                    self.error_msg = Some(error);
+                }
             }
         });
         ui.separator();
@@ -2234,7 +3065,10 @@ impl UptimePlotApp {
                                                 );
                                                 ui.checkbox(
                                                     &mut self.interleave_clear_existing,
-                                                    "Replace table",
+                                                    "Replace all rows",
+                                                )
+                                                .on_hover_text(
+                                                    "Delete the loaded/current schedule before generating.",
                                                 );
                                                 if ui.button("Generate").clicked() {
                                                     match self.generate_interleaved_skd_rows() {
@@ -2316,7 +3150,10 @@ impl UptimePlotApp {
                                             );
                                             ui.checkbox(
                                                 &mut self.five_point_clear_existing,
-                                                "Replace table",
+                                                "Replace all rows",
+                                            )
+                                            .on_hover_text(
+                                                "Delete the loaded/current schedule before generating.",
                                             );
                                             if ui.button("Generate 10 Scans").clicked() {
                                                 match self.generate_five_point_skd_rows() {
@@ -2384,41 +3221,50 @@ impl UptimePlotApp {
                                                     .suffix(" s"),
                                                 );
                                                 ui.label("");
-                                                if ui.button("Add Row").clicked() {
-                                                    if parse_time_string(&self.new_skd_start_time)
-                                                        .is_ok()
-                                                    {
-                                                        self.skd_rows.push(SkdRow {
-                                                            source_name: self.sources
-                                                                [self.new_skd_source_index]
-                                                                .0
-                                                                .name
-                                                                .clone(),
-                                                            start_date: self.new_skd_start_date,
-                                                            start_time: normalize_time_string(
-                                                                &self.new_skd_start_time,
-                                                            )
-                                                            .unwrap_or_else(|| {
-                                                                self.new_skd_start_time.clone()
-                                                            }),
-                                                            duration_sec: self.new_skd_duration_sec,
-                                                            az_offset_deg: 0.0,
-                                                            el_offset_deg: 0.0,
-                                                            ra_offset_deg: 0.0,
-                                                            dec_offset_deg: 0.0,
-                                                            include_station_offsets: false,
-                                                        });
-                                                        self.sort_skd_rows_by_start_time();
-                                                        self.error_msg = None;
-                                                    } else {
-                                                        self.error_msg = Some(
-                                                        "Start time must be HH:MM:SS or HHMMSS."
-                                                            .to_string(),
-                                                    );
-                                                    }
-                                                }
+                                                ui.label("");
                                                 ui.end_row();
                                             });
+                                        let selected_index = self
+                                            .selected_skd_row
+                                            .filter(|index| *index < self.skd_rows.len());
+                                        ui.small(match selected_index {
+                                            Some(index) => format!(
+                                                "Selected row: {} (click a row number to change)",
+                                                index + 1
+                                            ),
+                                            None => "Select a row number to insert before/after"
+                                                .to_string(),
+                                        });
+                                        let mut insertion_index = None;
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui.button("Append").clicked() {
+                                                insertion_index = Some(self.skd_rows.len());
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    selected_index.is_some(),
+                                                    egui::Button::new("Insert Before"),
+                                                )
+                                                .clicked()
+                                            {
+                                                insertion_index = selected_index;
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    selected_index.is_some(),
+                                                    egui::Button::new("Insert After"),
+                                                )
+                                                .clicked()
+                                            {
+                                                insertion_index = selected_index.map(|index| index + 1);
+                                            }
+                                        });
+                                        if let Some(index) = insertion_index {
+                                            match self.insert_new_skd_row(index) {
+                                                Ok(()) => self.error_msg = None,
+                                                Err(error) => self.error_msg = Some(error),
+                                            }
+                                        }
                                     });
                                 }
                             });
@@ -2431,9 +3277,351 @@ impl UptimePlotApp {
                 egui::vec2(right_width, available.y),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
+                    self.selected_skd_rows
+                        .retain(|index| *index < self.skd_rows.len());
+                    if self
+                        .selected_skd_row
+                        .is_none_or(|index| !self.selected_skd_rows.contains(&index))
+                    {
+                        self.selected_skd_row =
+                            self.selected_skd_rows.iter().next_back().copied();
+                    }
+                    let selected_index = self.selected_skd_row;
+                    let selected_count = self.selected_skd_rows.len();
+                    let mut row_action = None;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(if selected_count == 0 {
+                            "Row actions".to_string()
+                        } else {
+                            format!("{} selected", selected_count)
+                        });
+                        if ui.button("Select All").clicked() {
+                            self.selected_skd_rows = (0..self.skd_rows.len()).collect();
+                            self.selected_skd_row = self.skd_rows.len().checked_sub(1);
+                        }
+                        if ui
+                            .add_enabled(selected_count > 0, egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            self.clear_skd_selection();
+                        }
+                        if ui
+                            .add_enabled(
+                                selected_count > 0,
+                                egui::Button::new("Duplicate Block"),
+                            )
+                            .clicked()
+                        {
+                            row_action = Some("duplicate");
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_skd_rows
+                                    .iter()
+                                    .next()
+                                    .is_some_and(|index| *index > 0),
+                                egui::Button::new("Move Block Up"),
+                            )
+                            .clicked()
+                        {
+                            row_action = Some("up");
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_skd_rows
+                                    .iter()
+                                    .next_back()
+                                    .is_some_and(|index| *index + 1 < self.skd_rows.len()),
+                                egui::Button::new("Move Block Down"),
+                            )
+                            .clicked()
+                        {
+                            row_action = Some("down");
+                        }
+                        ui.separator();
+                        ui.label("Slew gap");
+                        ui.add(
+                            egui::DragValue::new(&mut self.skd_slew_gap_sec)
+                                .speed(5)
+                                .range(0..=86400)
+                                .suffix(" s"),
+                        );
+                        if ui
+                            .add_enabled(
+                                selected_index.is_some_and(|index| index > 0),
+                                egui::Button::new("Start After Previous"),
+                            )
+                            .on_hover_text(
+                                "Set this row to the previous row's end time plus the slew gap.",
+                            )
+                            .clicked()
+                        {
+                            row_action = Some("after_previous");
+                        }
+                        if ui
+                            .add_enabled(
+                                selected_count > 0,
+                                egui::Button::new("Delete Selected"),
+                            )
+                            .clicked()
+                        {
+                            row_action = Some("delete");
+                        }
+                    });
+                    if let Some(action) = row_action {
+                        let result = match action {
+                            "duplicate" => self.duplicate_selected_skd_row(),
+                            "up" => self.move_selected_skd_row(-1),
+                            "down" => self.move_selected_skd_row(1),
+                            "after_previous" => self.set_selected_start_after_previous(),
+                            "delete" => self.delete_selected_skd_rows(),
+                            _ => Ok(()),
+                        };
+                        match result {
+                            Ok(()) => self.error_msg = None,
+                            Err(error) => self.error_msg = Some(error),
+                        }
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("Auto schedule");
+                        ui.label("Extra margin");
+                        ui.add(
+                            egui::DragValue::new(&mut self.skd_auto_slew_margin_sec)
+                                .speed(1)
+                                .range(0..=3600)
+                                .suffix(" s"),
+                        );
+                        if ui
+                            .add_enabled(
+                                self.skd_rows.len() >= 2,
+                                egui::Button::new("Recalculate Selected Row Onward"),
+                            )
+                            .on_hover_text(
+                                "Use the actual required slew time of both selected antennas.",
+                            )
+                            .clicked()
+                        {
+                            match self.auto_schedule_from_selected() {
+                                Ok(()) => self.error_msg = Some(
+                                    "Recalculated scan times using actual antenna slew."
+                                        .to_string(),
+                                ),
+                                Err(error) => self.error_msg = Some(error),
+                            }
+                        }
+                    });
+
+                    egui::CollapsingHeader::new("Observation Block / Bulk Edit")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let mut advanced_action = None;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong("Repeat selected block");
+                                if ui
+                                    .add_enabled(
+                                        !self.selected_skd_rows.is_empty(),
+                                        egui::Button::new("Copy Block"),
+                                    )
+                                    .clicked()
+                                {
+                                    advanced_action = Some("copy");
+                                }
+                                ui.label(format!(
+                                    "Clipboard: {} rows",
+                                    self.skd_block_clipboard.len()
+                                ));
+                                if ui
+                                    .add_enabled(
+                                        !self.skd_block_clipboard.is_empty()
+                                            && self.selected_skd_row.is_some(),
+                                        egui::Button::new("Paste Before"),
+                                    )
+                                    .clicked()
+                                {
+                                    advanced_action = Some("paste_before");
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.skd_block_clipboard.is_empty()
+                                            && self.selected_skd_row.is_some(),
+                                        egui::Button::new("Paste After"),
+                                    )
+                                    .clicked()
+                                {
+                                    advanced_action = Some("paste_after");
+                                }
+                                ui.label("Copies");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.skd_block_repeat_count)
+                                        .range(1..=1000),
+                                );
+                                ui.label("Gap");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.skd_block_gap_sec)
+                                        .speed(5)
+                                        .range(0..=86400)
+                                        .suffix(" s"),
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !self.selected_skd_rows.is_empty(),
+                                        egui::Button::new("Repeat Block"),
+                                    )
+                                    .clicked()
+                                {
+                                    advanced_action = Some("repeat");
+                                }
+                            });
+                            ui.separator();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong("Bulk edit selected rows");
+                                if !self.sources.is_empty() {
+                                    self.skd_bulk_source_index =
+                                        self.skd_bulk_source_index.min(self.sources.len() - 1);
+                                    egui::ComboBox::from_id_salt("skd_bulk_source")
+                                        .selected_text(
+                                            &self.sources[self.skd_bulk_source_index].0.name,
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (index, (source, _)) in
+                                                self.sources.iter().enumerate()
+                                            {
+                                                ui.selectable_value(
+                                                    &mut self.skd_bulk_source_index,
+                                                    index,
+                                                    &source.name,
+                                                );
+                                            }
+                                        });
+                                    if ui.button("Apply Source").clicked() {
+                                        advanced_action = Some("source");
+                                    }
+                                }
+                                ui.label("Duration");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.skd_bulk_duration_sec)
+                                        .speed(10)
+                                        .range(1..=86400)
+                                        .suffix(" s"),
+                                );
+                                if ui.button("Apply Duration").clicked() {
+                                    advanced_action = Some("duration");
+                                }
+                                ui.label("Shift");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.skd_bulk_shift_sec)
+                                        .speed(10)
+                                        .range(-86400..=86400)
+                                        .suffix(" s"),
+                                );
+                                if ui.button("Shift Times").clicked() {
+                                    advanced_action = Some("shift");
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Offsets (deg)  AZ");
+                                ui.add(egui::DragValue::new(
+                                    &mut self.skd_bulk_az_offset_deg,
+                                ));
+                                ui.label("EL");
+                                ui.add(egui::DragValue::new(
+                                    &mut self.skd_bulk_el_offset_deg,
+                                ));
+                                ui.label("RA");
+                                ui.add(egui::DragValue::new(
+                                    &mut self.skd_bulk_ra_offset_deg,
+                                ));
+                                ui.label("Dec");
+                                ui.add(egui::DragValue::new(
+                                    &mut self.skd_bulk_dec_offset_deg,
+                                ));
+                                if ui.button("Apply Offsets").clicked() {
+                                    advanced_action = Some("offsets");
+                                }
+                            });
+                            if let Some(action) = advanced_action {
+                                let result = match action {
+                                    "copy" => self.copy_selected_skd_block(),
+                                    "paste_before" => self
+                                        .selected_skd_row
+                                        .ok_or_else(|| "Select an insertion row first.".to_string())
+                                        .and_then(|index| self.paste_skd_block(index)),
+                                    "paste_after" => self
+                                        .selected_skd_row
+                                        .ok_or_else(|| "Select an insertion row first.".to_string())
+                                        .and_then(|index| self.paste_skd_block(index + 1)),
+                                    "repeat" => self.repeat_selected_skd_block(),
+                                    "source" => self.apply_bulk_source(),
+                                    "duration" => self.apply_bulk_duration(),
+                                    "shift" => self.apply_bulk_time_shift(),
+                                    "offsets" => self.apply_bulk_offsets(),
+                                    _ => Ok(()),
+                                };
+                                match result {
+                                    Ok(()) => self.error_msg = None,
+                                    Err(error) => self.error_msg = Some(error),
+                                }
+                            }
+                        });
+
+                    ui.separator();
                     self.rebuild_skd_status_cache();
+                    let problem_indices = self.skd_problem_indices();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut self.skd_show_problems_only, "Problems only");
+                        ui.label(format!("{} issues", problem_indices.len()));
+                        if ui
+                            .add_enabled(
+                                !problem_indices.is_empty(),
+                                egui::Button::new("Previous Issue"),
+                            )
+                            .clicked()
+                        {
+                            let current = self.selected_skd_row.unwrap_or(self.skd_rows.len());
+                            let target = problem_indices
+                                .iter()
+                                .rev()
+                                .copied()
+                                .find(|index| *index < current)
+                                .or_else(|| problem_indices.last().copied());
+                            if let Some(index) = target {
+                                self.select_only_skd_row(index);
+                                self.skd_scroll_to_row = Some(index);
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !problem_indices.is_empty(),
+                                egui::Button::new("Next Issue"),
+                            )
+                            .clicked()
+                        {
+                            let current = self.selected_skd_row.unwrap_or(usize::MAX);
+                            let target = problem_indices
+                                .iter()
+                                .copied()
+                                .find(|index| current == usize::MAX || *index > current)
+                                .or_else(|| problem_indices.first().copied());
+                            if let Some(index) = target {
+                                self.select_only_skd_row(index);
+                                self.skd_scroll_to_row = Some(index);
+                            }
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.skd_show_timeline, "Timeline");
+                        ui.small("Click row numbers; Ctrl-click and Shift-click select blocks.");
+                    });
+                    if self.skd_show_timeline {
+                        ui.small(
+                            "Timeline: upper lane = Observation; lower lane = Slew (orange) / Idle (gray).",
+                        );
+                        self.show_skd_timeline(ui);
+                    }
+
                     let mut remove_idx = None;
                     let mut table_changed = false;
+                    let rows_before_table_edit = self.skd_rows.clone();
                     egui::ScrollArea::both()
                         .id_salt("skd_schedule_scroll")
                         .auto_shrink([false, false])
@@ -2476,15 +3664,34 @@ impl UptimePlotApp {
                                             motion_1: "...".to_string(),
                                             motion_2: "...".to_string(),
                                         });
+                                if self.skd_show_problems_only
+                                    && !skd_status_has_problem(&status)
+                                {
+                                    continue;
+                                }
                                 let start_geometry = status.start_geometry;
                                 let end_geometry = status.end_geometry;
                                 let motion_check_1 = status.motion_1;
                                 let motion_check_2 = status.motion_2;
                                 ui.horizontal(|ui| {
-                                    ui.add_sized(
-                                        [SKD_COL_NUM, 20.0],
-                                        egui::Label::new((i + 1).to_string()),
-                                    );
+                                    let row_number_response = ui
+                                        .add_sized(
+                                            [SKD_COL_NUM, 20.0],
+                                            egui::Button::new((i + 1).to_string())
+                                                .selected(self.selected_skd_rows.contains(&i)),
+                                        )
+                                        .on_hover_text(
+                                            "Select row; Ctrl-click toggles and Shift-click selects a range.",
+                                        );
+                                    if self.skd_scroll_to_row == Some(i) {
+                                        row_number_response
+                                            .scroll_to_me(Some(egui::Align::Center));
+                                        self.skd_scroll_to_row = None;
+                                    }
+                                    if row_number_response.clicked() {
+                                        let modifiers = ui.input(|input| input.modifiers);
+                                        self.select_skd_row(i, modifiers);
+                                    }
                                     let selected_source = self.skd_rows[i].source_name.clone();
                                     egui::ComboBox::from_id_salt(format!("skd_source_{}", i))
                                         .width(SKD_COL_SOURCE)
@@ -2561,9 +3768,9 @@ impl UptimePlotApp {
                             }
                         });
                     if let Some(i) = remove_idx {
-                        self.skd_rows.remove(i);
-                        self.mark_skd_status_dirty();
+                        self.delete_skd_row(i);
                     } else if table_changed {
+                        self.record_skd_undo_snapshot(rows_before_table_edit);
                         self.mark_skd_status_dirty();
                     }
                 },
@@ -3178,6 +4385,24 @@ impl UptimePlotApp {
                     }
                 }
             }
+
+            let fixed_angle_rad = (90.0 - ANTENNA_FIXED_AZ_DEG).to_radians();
+            let fixed_radius = (90.0 - ANTENNA_FIXED_EL_DEG) / 90.0;
+            let fixed_position = vec![[
+                fixed_radius * fixed_angle_rad.cos(),
+                fixed_radius * fixed_angle_rad.sin(),
+            ]];
+            plot_ui.points(
+                Points::new(
+                    format!(
+                        "Antenna fixed position (AZ {:.0}°, EL {:.0}°)",
+                        ANTENNA_FIXED_AZ_DEG, ANTENNA_FIXED_EL_DEG
+                    ),
+                    PlotPoints::from(fixed_position),
+                )
+                .radius(7.0)
+                .color(egui::Color32::RED),
+            );
         });
         self.polar_plot_rect = Some(polar_response.response.rect);
     }
@@ -3806,6 +5031,16 @@ fn offset_schedule_time(
     ))
 }
 
+fn set_skd_row_datetime(row: &mut SkdRow, datetime: chrono::NaiveDateTime) {
+    row.start_date = datetime.date();
+    row.start_time = format!(
+        "{:02}:{:02}:{:02}",
+        datetime.time().hour(),
+        datetime.time().minute(),
+        datetime.time().second()
+    );
+}
+
 fn parse_time_string(value: &str) -> Result<(u32, u32, u32), String> {
     let trimmed = value.trim();
     let parsed = if trimmed.contains(':') {
@@ -4030,6 +5265,34 @@ mod tests {
 
         assert!((85.0..=95.0).contains(&ra_deg), "RA was {ra_deg}");
         assert!((22.0..=24.5).contains(&dec_deg), "Dec was {dec_deg}");
+    }
+
+    #[test]
+    fn schedule_offset_rolls_into_the_next_day() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let (shifted_date, shifted_time) = offset_schedule_time(date, "23:59:30", 90).unwrap();
+
+        assert_eq!(shifted_date, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert_eq!(shifted_time, "00:01:00");
+    }
+
+    #[test]
+    fn schedule_problem_detection_uses_geometry_and_motion_status() {
+        let ok = SkdRowStatus {
+            start_geometry: "120.0/45.0".to_string(),
+            end_geometry: "121.0/45.5".to_string(),
+            motion_1: "OK OK 10/30s".to_string(),
+            motion_2: "OK OK 12/30s".to_string(),
+        };
+        assert!(!skd_status_has_problem(&ok));
+
+        let mut failed = ok.clone();
+        failed.motion_2 = "OK NO 35/30s".to_string();
+        assert!(skd_status_has_problem(&failed));
+
+        failed.motion_2.clear();
+        failed.motion_1 = "Load ant".to_string();
+        assert!(skd_status_has_problem(&failed));
     }
 
     #[test]

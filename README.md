@@ -12,6 +12,9 @@ uptimeplot is a Rust/egui desktop tool for checking source visibility and making
 - Check scan start/end AZ/EL and antenna slew/limit status.
 - Generate target/gain-calibrator interleaved schedules.
 - Generate five-point observation schedules with station-specific AZ/EL offsets.
+- Edit schedule rows and reusable observation blocks with undo/redo.
+- Recalculate scan times from the actual slew required by both antennas.
+- Filter schedule problems and inspect observation, slew, and idle time on a timeline.
 
 ## Data Files
 
@@ -123,6 +126,27 @@ source name, recording start time, observation time, AZ offset, EL offset, RA of
 ```
 
 AZ/EL offsets are arcminutes. RA/Dec offsets are degrees.
+
+## SKD Table Editing
+
+Click a row number to select it. Use `Ctrl-click` to toggle individual rows and
+`Shift-click` to select a range. Selected rows can be duplicated, moved as a
+block, deleted, or edited together. The New Row panel can append a row or insert
+it before or after the active row.
+
+`Recalculate Selected Row Onward` calculates the earliest start time of every
+following scan from the antenna AZ/EL positions and slew rates. When two
+antennas are selected, the slower required transition is used. `Extra margin`
+adds optional safety time.
+
+The Observation Block panel can copy a selected block, paste it before or after
+another row, and create repeated copies while preserving relative scan timing.
+Undo and redo cover schedule edits, generation, sorting, time shifts, and bulk
+operations.
+
+Enable `Problems only` to show rows with AZ/EL-limit, overlap, or slew failures.
+The timeline uses blue for observations, orange for valid slew intervals, gray
+for idle time, and red for schedule problems.
 
 ## Notes
 
