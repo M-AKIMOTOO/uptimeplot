@@ -4,7 +4,7 @@ uptimeplot is a Rust/egui desktop tool for checking source visibility and making
 
 ## Features
 
-- Plot source azimuth/elevation over a UTC day.
+- Plot source and Sun azimuth/elevation over a UTC day for EL >= 1 degree.
 - Show polar and LST plots for selected sources.
 - Load source, station, and antenna files.
 - Build observation schedules in the SKD Table tab.

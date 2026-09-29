@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 mod utils;
 
 const PLOT_Y_AXIS_MIN_WIDTH: f32 = 96.0;
+const PLOT_MIN_ELEVATION_DEG: f64 = 1.0;
 const DEFAULT_FIVE_POINT_OFFSET_ARCMIN: f64 = 2.0;
 
 const SKD_COL_NUM: f32 = 24.0;
@@ -468,6 +469,10 @@ fn source_table_text(name: &str) -> String {
         value.push(' ');
     }
     value
+}
+
+fn is_sun_track(name: &str) -> bool {
+    name == "Sun" || name.ends_with(" / Sun")
 }
 
 fn show_table_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) {
@@ -1083,7 +1088,7 @@ impl UptimePlotApp {
                         );
 
                         az_points.push([hour_float, az]);
-                        if el >= 0.0 {
+                        if el >= PLOT_MIN_ELEVATION_DEG {
                             el_points.push([hour_float, el]);
                         } else {
                             el_points.push([hour_float, f64::NAN]);
@@ -1098,7 +1103,7 @@ impl UptimePlotApp {
                         }
 
                         lst_az_points.push([lst_hour, az]);
-                        if el >= 0.0 {
+                        if el >= PLOT_MIN_ELEVATION_DEG {
                             lst_el_points.push([lst_hour, el]);
                         } else {
                             lst_el_points.push([lst_hour, f64::NAN]);
@@ -1111,6 +1116,50 @@ impl UptimePlotApp {
                 new_plot_data.push((label.clone(), az_points, el_points));
                 new_lst_plot_data.push((label, lst_az_points, lst_el_points));
             }
+
+            let mut sun_az_points = Vec::new();
+            let mut sun_el_points = Vec::new();
+            let mut sun_lst_az_points = Vec::new();
+            let mut sun_lst_el_points = Vec::new();
+            let mut previous_sun_lst: Option<f64> = None;
+
+            for minute_of_day in (0..=(24 * 60)).step_by(3) {
+                let hour_float = minute_of_day as f64 / 60.0;
+                let hour = (minute_of_day / 60) as u32;
+                let minute = (minute_of_day % 60) as u32;
+
+                if let Some(time) = self.selected_date.and_hms_opt(hour, minute, 0) {
+                    let datetime_utc = Utc.from_utc_datetime(&time);
+                    let (sun_ra, sun_dec) = utils::sun_radec(datetime_utc);
+                    let (az, el, _) = utils::radec2azalt(ant_pos, datetime_utc, sun_ra, sun_dec);
+
+                    sun_az_points.push([hour_float, az]);
+                    if el >= PLOT_MIN_ELEVATION_DEG {
+                        sun_el_points.push([hour_float, el]);
+                    } else {
+                        sun_el_points.push([hour_float, f64::NAN]);
+                    }
+
+                    let lst_hour = utils::utc_to_lst_hours(ant_pos, datetime_utc);
+                    if let Some(previous_lst) = previous_sun_lst {
+                        if lst_hour + 12.0 < previous_lst {
+                            sun_lst_az_points.push([f64::NAN, f64::NAN]);
+                            sun_lst_el_points.push([f64::NAN, f64::NAN]);
+                        }
+                    }
+                    sun_lst_az_points.push([lst_hour, az]);
+                    if el >= PLOT_MIN_ELEVATION_DEG {
+                        sun_lst_el_points.push([lst_hour, el]);
+                    } else {
+                        sun_lst_el_points.push([lst_hour, f64::NAN]);
+                    }
+                    previous_sun_lst = Some(lst_hour);
+                }
+            }
+
+            let sun_label = format!("{} / Sun", station.name);
+            new_plot_data.push((sun_label.clone(), sun_az_points, sun_el_points));
+            new_lst_plot_data.push((sun_label, sun_lst_az_points, sun_lst_el_points));
         }
 
         self.plot_data = new_plot_data;
@@ -1152,7 +1201,7 @@ impl UptimePlotApp {
                 let az = az_points[i][1];
                 let el = el_points[i][1];
 
-                if !el.is_nan() && el >= 0.0 {
+                if !el.is_nan() && el >= PLOT_MIN_ELEVATION_DEG {
                     let angle_rad = (90.0f64 - az).to_radians();
                     let radius = (90.0 - el) / 90.0;
                     let x = radius * angle_rad.cos();
@@ -2652,7 +2701,11 @@ impl UptimePlotApp {
                 [24.7, 365.0],
             ));
             for (name, az_points, _) in &self.plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(az_points.clone())));
+                let mut line = Line::new(name.clone(), PlotPoints::from(az_points.clone()));
+                if is_sun_track(name) {
+                    line = line.color(egui::Color32::YELLOW);
+                }
+                plot_ui.line(line);
             }
         });
 
@@ -2664,7 +2717,11 @@ impl UptimePlotApp {
                 [24.7, 91.0],
             ));
             for (name, _, el_points) in &self.plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(el_points.clone())));
+                let mut line = Line::new(name.clone(), PlotPoints::from(el_points.clone()));
+                if is_sun_track(name) {
+                    line = line.color(egui::Color32::YELLOW);
+                }
+                plot_ui.line(line);
             }
         });
 
@@ -3089,16 +3146,22 @@ impl UptimePlotApp {
             }
 
             for (name, polar_points, hour_marker_points, hour_labels) in &self.polar_plot_data {
+                let sun_track = is_sun_track(name);
                 if !polar_points.is_empty() {
-                    plot_ui.points(Points::new(
-                        name.clone(),
-                        PlotPoints::from(polar_points.clone()),
-                    ));
+                    let mut points =
+                        Points::new(name.clone(), PlotPoints::from(polar_points.clone()));
+                    if sun_track {
+                        points = points.color(egui::Color32::YELLOW);
+                    }
+                    plot_ui.points(points);
                 }
                 if !hour_marker_points.is_empty() {
-                    plot_ui.points(
-                        Points::new("", PlotPoints::from(hour_marker_points.clone())).radius(3.5),
-                    );
+                    let mut markers =
+                        Points::new("", PlotPoints::from(hour_marker_points.clone())).radius(3.5);
+                    if sun_track {
+                        markers = markers.color(egui::Color32::YELLOW);
+                    }
+                    plot_ui.points(markers);
                     for (label_x, label_y, label_text) in hour_labels {
                         plot_ui.text(
                             egui_plot::Text::new(
@@ -3106,7 +3169,11 @@ impl UptimePlotApp {
                                 egui_plot::PlotPoint::new(*label_x, *label_y),
                                 label_text.clone(),
                             )
-                            .color(egui::Color32::LIGHT_GRAY),
+                            .color(if sun_track {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::LIGHT_GRAY
+                            }),
                         );
                     }
                 }
@@ -3227,7 +3294,11 @@ impl UptimePlotApp {
                 [24.7, 365.0],
             ));
             for (name, az_points, _) in lst_plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(az_points.clone())));
+                let mut line = Line::new(name.clone(), PlotPoints::from(az_points.clone()));
+                if is_sun_track(name) {
+                    line = line.color(egui::Color32::YELLOW);
+                }
+                plot_ui.line(line);
             }
         });
 
@@ -3239,7 +3310,11 @@ impl UptimePlotApp {
                 [24.7, 91.0],
             ));
             for (name, _, el_points) in lst_plot_data {
-                plot_ui.line(Line::new(name.clone(), PlotPoints::from(el_points.clone())));
+                let mut line = Line::new(name.clone(), PlotPoints::from(el_points.clone()));
+                if is_sun_track(name) {
+                    line = line.color(egui::Color32::YELLOW);
+                }
+                plot_ui.line(line);
             }
         });
 
@@ -3944,6 +4019,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing\n");
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sun_position_is_near_the_june_solstice() {
+        let time = Utc.with_ymd_and_hms(2026, 6, 21, 12, 0, 0).unwrap();
+        let (ra, dec) = utils::sun_radec(time);
+        let ra_deg = ra.to_degrees().rem_euclid(360.0);
+        let dec_deg = dec.to_degrees();
+
+        assert!((85.0..=95.0).contains(&ra_deg), "RA was {ra_deg}");
+        assert!((22.0..=24.5).contains(&dec_deg), "Dec was {dec_deg}");
     }
 
     #[test]

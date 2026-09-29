@@ -1,7 +1,6 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
-use astro::coords;
-use astro::time;
+use astro::{coords, ecliptic, sun, time};
 use nav_types::{ECEF, WGS84};
 use std::path::Path;
 use std::process::Command;
@@ -45,6 +44,27 @@ pub fn radec2azalt(
         coords::az_frm_eq(hour_angle, obs_dec, latitude_radian).to_degrees() + 180.0,
         coords::alt_frm_eq(hour_angle, obs_dec, latitude_radian).to_degrees(),
         height_meter,
+    )
+}
+
+pub fn sun_radec(time_utc: DateTime<Utc>) -> (f64, f64) {
+    let decimal_day = time_utc.day() as f64
+        + time_utc.hour() as f64 / 24.0
+        + time_utc.minute() as f64 / (24.0 * 60.0)
+        + time_utc.second() as f64 / (24.0 * 60.0 * 60.0);
+    let date = time::Date {
+        year: time_utc.year() as i16,
+        month: time_utc.month() as u8,
+        decimal_day,
+        cal_type: time::CalType::Gregorian,
+    };
+    let julian_day = time::julian_day(&date);
+    let (ecliptic_position, _) = sun::geocent_ecl_pos(julian_day);
+    let obliquity = ecliptic::mn_oblq_IAU(julian_day);
+
+    (
+        coords::asc_frm_ecl(ecliptic_position.long, ecliptic_position.lat, obliquity),
+        coords::dec_frm_ecl(ecliptic_position.long, ecliptic_position.lat, obliquity),
     )
 }
 
