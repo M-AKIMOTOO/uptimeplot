@@ -5,6 +5,8 @@ uptimeplot is a Rust/egui desktop tool for checking source visibility and making
 ## Features
 
 - Plot source and Sun azimuth/elevation over a UTC day for EL >= 1 degree.
+- Show source tracks, hourly UT markers, and the YAMAGU32 skyline in an azimuth/elevation plot.
+- Overlay the YAMAGU32 skyline on the polar plot.
 - Show polar and LST plots for selected sources.
 - Load source, station, and antenna files.
 - Build observation schedules in the SKD Table tab.
@@ -35,6 +37,9 @@ The files are:
 - `source.txt`
 - `antenna.sch`
 - `station.txt`
+
+The AzEL and polar plots embed `Yamaguchi-Skyline_32m.TXT` at build time. Their
+skyline line applies to YAMAGU32 and covers the measured azimuth range of 2–358 degrees.
 
 If `source.txt` or `station.txt` is missing, the program creates an empty file
 containing only a `#` format header. The embedded default `antenna.sch` is copied

@@ -1,18 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Corner, GridMark, Legend, Line, Plot, PlotPoints, Points};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 mod utils;
 
 const PLOT_Y_AXIS_MIN_WIDTH: f32 = 96.0;
 const PLOT_MIN_ELEVATION_DEG: f64 = 1.0;
 const DEFAULT_FIVE_POINT_OFFSET_ARCMIN: f64 = 2.0;
+const YAMAGUCHI_SKYLINE_DATA: &str = include_str!("../Yamaguchi-Skyline_32m.TXT");
 const ANTENNA_FIXED_AZ_DEG: f64 = 244.0;
 const ANTENNA_FIXED_EL_DEG: f64 = 20.0;
 const SKD_HISTORY_LIMIT: usize = 100;
@@ -39,6 +41,7 @@ const SKD_TABLE_MIN_WIDTH: f32 = SKD_COL_NUM
 enum AppTab {
     UptimePlotters,
     Parameters,
+    AzElPlot,
     PolarPlot,
     LstPlot,
     SkdTable,
@@ -478,6 +481,74 @@ fn is_sun_track(name: &str) -> bool {
     name == "Sun" || name.ends_with(" / Sun")
 }
 
+fn yamaguchi_skyline_data() -> &'static [[f64; 2]] {
+    static SKYLINE: OnceLock<Vec<[f64; 2]>> = OnceLock::new();
+    SKYLINE
+        .get_or_init(|| {
+            let mut points: Vec<[f64; 2]> = YAMAGUCHI_SKYLINE_DATA
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') || line.starts_with('*') {
+                        return None;
+                    }
+                    let mut columns = line.split_whitespace();
+                    let az = columns.next()?.parse::<f64>().ok()?;
+                    let elevation = columns.next()?.parse::<f64>().ok()?;
+                    (az.is_finite() && elevation.is_finite()).then_some([az, elevation])
+                })
+                .collect();
+            points.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            points
+        })
+        .as_slice()
+}
+
+fn azel_track_segments(az_points: &[[f64; 2]], el_points: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
+    let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
+    let mut current: Vec<[f64; 2]> = Vec::new();
+    for (az_point, el_point) in az_points.iter().zip(el_points) {
+        let az = az_point[1];
+        let el = el_point[1];
+        if !az.is_finite() || !el.is_finite() || el < PLOT_MIN_ELEVATION_DEG {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let az = az.rem_euclid(360.0);
+        if current
+            .last()
+            .is_some_and(|point| (point[0] - az).abs() > 180.0)
+        {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push([az, el]);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn azel_hour_markers(az_points: &[[f64; 2]], el_points: &[[f64; 2]]) -> Vec<([f64; 2], i32)> {
+    az_points
+        .iter()
+        .zip(el_points)
+        .filter_map(|(az_point, el_point)| {
+            let hour = az_point[0];
+            let az = az_point[1];
+            let el = el_point[1];
+            (hour.is_finite()
+                && az.is_finite()
+                && el.is_finite()
+                && el >= PLOT_MIN_ELEVATION_DEG
+                && (hour - hour.round()).abs() < 1e-6)
+                .then(|| ([az.rem_euclid(360.0), el], hour.round() as i32))
+        })
+        .collect()
+}
+
 fn show_table_text_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) {
     ui.allocate_ui_with_layout(
         egui::vec2(width, height),
@@ -879,6 +950,7 @@ impl eframe::App for UptimePlotApp {
                     AppTab::UptimePlotters,
                     "Uptime Plotters",
                 );
+                ui.selectable_value(&mut self.selected_tab, AppTab::AzElPlot, "AzEL Plot");
                 ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot, "Polar Plot");
                 ui.selectable_value(&mut self.selected_tab, AppTab::LstPlot, "LST Plot");
                 ui.selectable_value(&mut self.selected_tab, AppTab::SkdTable, "SKD Table");
@@ -888,6 +960,7 @@ impl eframe::App for UptimePlotApp {
         egui::CentralPanel::default().show_inside(ui, |ui| match self.selected_tab {
             AppTab::UptimePlotters => self.ui_uptime_plotters_tab(ui),
             AppTab::Parameters => self.ui_parameters_tab(ui),
+            AppTab::AzElPlot => self.ui_azel_plot_tab(ui),
             AppTab::PolarPlot => self.ui_polar_plot_tab(ui),
             AppTab::LstPlot => self.ui_lst_plot_tab(ui),
             AppTab::SkdTable => self.ui_skd_table_tab(ui),
@@ -1695,8 +1768,13 @@ impl UptimePlotApp {
         }
         drg_sked_section.push_str("*\n");
 
-        let drg_content =
-            build_new_drg_content(obs_code, &self.pi_name, &sources_section, &drg_sked_section);
+        let drg_content = build_new_drg_content(
+            obs_code,
+            &self.pi_name,
+            Local::now().date_naive(),
+            &sources_section,
+            &drg_sked_section,
+        );
         let skd32_content =
             build_simple_skd_content(obs_code, &sources_section, &self.skd_rows, Some("32"))?;
         let skd34_content =
@@ -3935,6 +4013,83 @@ impl UptimePlotApp {
         self.uptime_plot_rect = Some(az_response.response.rect.union(el_response.response.rect));
     }
 
+    fn ui_azel_plot_tab(&mut self, ui: &mut egui::Ui) {
+        let palette = [
+            egui::Color32::from_rgb(82, 190, 255),
+            egui::Color32::from_rgb(237, 107, 135),
+            egui::Color32::from_rgb(126, 220, 145),
+            egui::Color32::from_rgb(201, 153, 255),
+            egui::Color32::from_rgb(246, 175, 93),
+            egui::Color32::from_rgb(98, 220, 215),
+        ];
+        Plot::new("azel_plot")
+            .width(ui.available_width())
+            .height(ui.available_height())
+            .x_axis_label("Azimuth (deg)")
+            .y_axis_label("Elevation (deg)")
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
+            .legend(Legend::default())
+            .coordinates_formatter(
+                Corner::LeftTop,
+                egui_plot::CoordinatesFormatter::new(|point, _| {
+                    format!("Az: {:.1}°\nEl: {:.1}°", point.x, point.y)
+                }),
+            )
+            .show(ui, |plot_ui| {
+                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                    [0.0, 0.0],
+                    [360.0, 90.0],
+                ));
+                plot_ui.line(
+                    Line::new(
+                        "YAMAGU32 skyline",
+                        PlotPoints::from(yamaguchi_skyline_data().to_vec()),
+                    )
+                    .color(egui::Color32::from_rgb(240, 160, 60))
+                    .width(2.0),
+                );
+                for (index, (name, az_points, el_points)) in self.plot_data.iter().enumerate() {
+                    let track_id = egui::Id::new(("azel_track", index));
+                    let color = if is_sun_track(name) {
+                        egui::Color32::YELLOW
+                    } else {
+                        palette[index % palette.len()]
+                    };
+                    for segment in azel_track_segments(az_points, el_points) {
+                        plot_ui.line(
+                            Line::new(name.clone(), PlotPoints::from(segment))
+                                .id(track_id)
+                                .color(color),
+                        );
+                    }
+                    let markers = azel_hour_markers(az_points, el_points);
+                    if !markers.is_empty() {
+                        let points = markers.iter().map(|(point, _)| *point).collect::<Vec<_>>();
+                        plot_ui.points(
+                            Points::new("", PlotPoints::from(points))
+                                .id(track_id)
+                                .color(color)
+                                .radius(3.5),
+                        );
+                        for ([az, el], hour) in markers {
+                            plot_ui.text(
+                                egui_plot::Text::new(
+                                    "",
+                                    egui_plot::PlotPoint::new(az, el + 0.8),
+                                    format!("{hour:02}h"),
+                                )
+                                .id(track_id)
+                                .anchor(egui::Align2::CENTER_BOTTOM)
+                                .color(color),
+                            );
+                        }
+                    }
+                }
+            });
+    }
+
     fn ui_parameters_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Parameters");
         ui.add_space(10.0);
@@ -4351,6 +4506,20 @@ impl UptimePlotApp {
                     .color(egui::Color32::DARK_GRAY),
                 );
             }
+
+            let skyline_points: Vec<[f64; 2]> = yamaguchi_skyline_data()
+                .iter()
+                .map(|[az, el]| {
+                    let angle = (90.0 - az).to_radians();
+                    let radius = (90.0 - el) / 90.0;
+                    [radius * angle.cos(), radius * angle.sin()]
+                })
+                .collect();
+            plot_ui.line(
+                Line::new("YAMAGU32 skyline", PlotPoints::from(skyline_points))
+                    .color(egui::Color32::from_rgb(240, 160, 60))
+                    .width(2.0),
+            );
 
             for (name, polar_points, hour_marker_points, hour_labels) in &self.polar_plot_data {
                 let sun_track = is_sun_track(name);
@@ -4879,6 +5048,7 @@ fn build_simple_skd_content(
 fn build_new_drg_content(
     obs_code: &str,
     pi_name: &str,
+    created_date: NaiveDate,
     sources_section: &str,
     sked_section: &str,
 ) -> String {
@@ -4895,6 +5065,8 @@ fn build_new_drg_content(
     content.push_str(sked_section.trim_end());
     content.push('\n');
     content.push_str(DRG_HEAD_CODES_SECTION);
+    content.push_str("* M.AKIMOTO\n");
+    content.push_str(&format!("* {}\n", created_date.format("%Y/%m/%d")));
     content
 }
 
@@ -5235,6 +5407,43 @@ fn calendar_ui(ui: &mut egui::Ui, date: &mut NaiveDate) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn azel_hour_markers_only_show_visible_whole_ut_hours() {
+        let az = [[0.0, 359.0], [0.05, 2.0], [1.0, 361.0], [2.0, 3.0]];
+        let el = [[0.0, 20.0], [0.05, 21.0], [1.0, 10.0], [2.0, f64::NAN]];
+        assert_eq!(
+            azel_hour_markers(&az, &el),
+            vec![([359.0, 20.0], 0), ([1.0, 10.0], 1)]
+        );
+    }
+
+    #[test]
+    fn azel_tracks_break_at_north_and_below_elevation_limit() {
+        let az = [
+            [0.0, 350.0],
+            [1.0, 359.0],
+            [2.0, 1.0],
+            [3.0, 2.0],
+            [4.0, 3.0],
+        ];
+        let el = [
+            [0.0, 15.0],
+            [1.0, 12.0],
+            [2.0, 11.0],
+            [3.0, f64::NAN],
+            [4.0, 5.0],
+        ];
+        let segments = azel_track_segments(&az, &el);
+        assert_eq!(
+            segments,
+            vec![
+                vec![[350.0, 15.0], [359.0, 12.0]],
+                vec![[1.0, 11.0]],
+                vec![[3.0, 5.0]]
+            ]
+        );
+    }
 
     #[test]
     fn missing_text_file_is_initialized_without_overwriting_existing_content() {
